@@ -1,0 +1,3 @@
+# Treat scientific data and distributed executables as binary files.
+*.hdf5 -text
+bin/* -text

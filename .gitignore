@@ -1,0 +1,26 @@
+# Local build products
+.build/
+bin/
+data/
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+.DS_Store
+.vscode/
+
+# Runtime logs and generated settings
+*.log
+python/spadexp_4d.ini.json
+
+# Per-structure generated OpenMX, mesh, PAD, and result data
+structures/*/.openmx.base.dat
+structures/*/.normalized.cif
+structures/*/cache/
+structures/*/results/
+
+# Local calculation exchange areas
+exchange/upload/*
+!exchange/upload/.gitkeep
+exchange/download/*
+!exchange/download/.gitkeep
