@@ -347,6 +347,9 @@ def file_lock(path):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+MO_CUBE_KEYS = ('num.HOMOs', 'num.LUMOs')
+
+
 def input_text(stem, points):
     text = TEMPLATE.read_text()
     text = re.sub(r'(?m)^System\.Name\s+\S+', f'System.Name {stem}', text)
@@ -367,7 +370,18 @@ def input_text(stem, points):
         text = re.sub(r'SPADExp\.dimension.*?SPADExp\.maxN\s+\d+', block, text, count=1, flags=re.S)
     else:
         text += '\n' + block + '\n'
-    return text + (f'\nMO.fileout on\nMO.Nkpoint {len(points)}\n<MO.kpoint\n'
+    # With MO.fileout on, OpenMX also writes num.HOMOs/num.LUMOs cube files
+    # (default 1 each, real and imaginary) for every MO k point: ~1.2 MB per
+    # point for graphite, tens of GB for a fine mesh.  The converter reads only
+    # the .EV LCAO block, which always lists every band, so disable the cubes.
+    cube_lines = ''
+    for key in MO_CUBE_KEYS:
+        pattern = rf'(?mi)^{re.escape(key)}\s+.*$'
+        if re.search(pattern, text):
+            text = re.sub(pattern, f'{key} 0', text)
+        else:
+            cube_lines += f'{key} 0\n'
+    return text + (f'\n{cube_lines}MO.fileout on\nMO.Nkpoint {len(points)}\n<MO.kpoint\n'
                    + '\n'.join(' '.join(f'{v:.12f}' for v in p) for p in points) + '\nMO.kpoint>\n')
 
 
@@ -448,14 +462,16 @@ def completed_openmx(folder, stem, text):
         output_matches = bool(record and record.get('output') == stamp(out))
         input_matches = bool(record and record.get('input') == hashlib.sha256(text.encode()).hexdigest())
         # Saving a newly generated SCF restart changes only the restart lines
-        # of the next input.  Reuse the already completed MO output when the
-        # original recorded input differs solely in those lines.
+        # of the next input, and num.HOMOs/num.LUMOs only select cube files.
+        # Reuse the already completed MO output when the original recorded
+        # input differs solely in those lines.
         dat = folder / f'{stem}.dat'
         if not input_matches and record and dat.is_file():
             stored = dat.read_text(errors='replace')
             stored_recorded = record.get('input') == hashlib.sha256(stored.encode()).hexdigest()
             def without_restart(value):
-                return re.sub(r'(?m)^(?:scf\.restart(?:\.filename)?|orbitalOpt\.Force\.Skip)\s+.*\n?', '', value)
+                return re.sub(r'(?mi)^(?:scf\.restart(?:\.filename)?|orbitalOpt\.Force\.Skip'
+                              r'|num\.HOMOs|num\.LUMOs)\s+.*\n?', '', value)
             input_matches = stored_recorded and without_restart(stored) == without_restart(text)
         return normal and output_matches and input_matches
     except OSError:
