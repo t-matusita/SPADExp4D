@@ -2,7 +2,7 @@
 
 English | [日本語](README_JP.md)
 
-Current version: **1.1.0**
+Current version: **1.2.0**
 
 SPADExp4D is research software for calculating and visualizing photoemission angular distributions (PADs) for angle-resolved photoemission spectroscopy (ARPES) in four-dimensional `(kx, ky, kz, E)` space using output from the first-principles code OpenMX.
 
@@ -169,7 +169,7 @@ structures/<structure_name>/
 └── results/      generated, ignored by Git
 ```
 
-Automatic processing does not support partial occupancy, disordered sites, or undefined elements. Complete-band eigenstate storage currently requires `scf.SpinPolarization off`.
+Automatic processing does not support partial occupancy, disordered sites, or undefined elements.
 
 ## GUI operation
 
@@ -181,31 +181,66 @@ After startup, select a structure from `計算対象` (calculation target). To a
 
 Set the first-Brillouin-zone divisions with `N1, N2, N3`. Larger divisions can improve sampling, but increase OpenMX time and HDF5 storage. Press `Calc` to calculate the required eigenstates with OpenMX. Existing caches with matching conditions are reused, and only missing portions are calculated.
 
+The `OpenMX Parameters` tab edits OpenMX keywords per calculation target:
+
+- `scf.XcType`, `scf.SpinPolarization` (off / on / NC), `scf.SpinOrbit.Coupling` (NC only), `scf.energycutoff`, `scf.Kgrid`, `scf.ElectronicTemperature`, `scf.criterion`, `scf.maxIter`.
+- Values start from the CIF-generated `.openmx.base.dat`. Changed values are shown in bold and stored under `"openmx"` in `parameter.json`; the next `Calc` then runs a new SCF and k-space HDF5 (each keyword set has its own SCF restart).
+- `Reset to recommended` sets values derived from the cell (`scf.Kgrid` with a k-point spacing of at most 0.2 Å⁻¹, `scf.maxIter` ≥ 200, …), never weaker than the template.
+- With `scf.SpinPolarization on` the PAD of both spins is summed; with `NC` both spinor components are summed. Use `NC` with `scf.SpinOrbit.Coupling` for spin-orbit coupling in a paramagnetic state.
+- `Stored bands E−EF` limits the bands stored in the k-space HDF5 to an energy window (`All` stores every band). For NC, a window covering the EB range of interest reduces HDF5 size and memory several-fold; states outside it are absent from PAD.
+
 Confirm the dialog with `Yes` to start. OpenMX logs and progress are shown while running; use `Cancel` to stop when necessary.
 
-### 3. Set PAD display conditions
+### 3. Set PAD conditions (`PAD` tab)
 
+Below `K-space HDF5`, the settings are split into the `PAD` and `Band Diagram` tabs. The `PAD` tab lists, in order:
+
+- `PAD calculation`: `C++ batch` or the comparison `Python per EB (comparison)` backend
 - `hν`: photon energy
-- `V0`: inner potential; `V0 <= 0` uses the automatic setting
+- `Polarization`: `lx`, `ly`, `c+`, `c-`, or `unpolarized`
+- `Incident Angles (zyz Euler)`: Euler angles a, b, c (z-y-z rotation) of the incident light (a and c: −360 to 360°, b: 0 to 180°). Press the `Incident Angles (zyz Euler, °)…` button to choose a beamline preset (SPring-8 BL25SU: 0, 90, −90; UVSOR PMM: 0, 68, −90) and apply it with OK
 - `EF shift`: display-only Fermi-level shift
+- `V0`: inner potential; `V0 <= 0` uses the automatic setting
 - `wfnc`: photoelectron wavefunction parameter
+- `Slice direction`: `kx`, `ky`, or `kz`, the direction of the PAD and band slices
+- `KMin, KMax, Kstep`: displayed momentum range and step
 - `EB Begin, End, Step`: binding-energy range and step
-- `偏光`: `lx`, `ly`, `c+`, `c-`, or `unpolarized`
-- `Euler a, b, c`: rotation angles for polarization/crystal coordinates
+- `Gaussian dK`, `Gaussian dE`: momentum- and energy-direction Gaussian smoothing of saved PAD data; changing them does not require OpenMX or PAD recalculation
+- `Maximum angle θmax`: PAD outside this emission angle is not shown
+- `Boundary`: overlay first-Brillouin-zone boundaries
 
-Changing PAD conditions reuses the first-Brillouin-zone eigenstate cache. Select either `C++ 一括計算` (batched C++) or the comparison `Python EB毎` backend from `PAD計算`.
+Changing PAD conditions reuses the first-Brillouin-zone eigenstate cache.
 
-### 4. Set cuts and smoothing
+### 4. Set the band-diagram cut (`Band Diagram` tab)
 
-Select `kx`, `ky`, or `kz` with `断面方向` and set the cut coordinates `a` and `b`. `KMin, KMax, Kstep` define the displayed momentum range and step. Enable `Brillouin zone表示` to overlay first-Brillouin-zone boundaries.
+Set the fixed coordinates of the slice chosen with `Slice direction`. For a `kx` slice, `ky fixed` sets ky; kz is not fixed but follows the photoemission sphere at each EB, kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²), so `kz fixed` is disabled (likewise for `ky`). For a `kz` slice, `kx fixed` and `ky fixed` set the point the trajectory passes through.
 
-`Gaussian dK` and `Gaussian dE` apply momentum- and energy-direction Gaussian smoothing to saved PAD data. Changing smoothing does not require OpenMX or PAD recalculation.
+The figure shows `Band Slice EB′` and `PAD: EB′` (kx–ky maps at the selected EB), `Band Slice kx-EB` and `PAD Slice kx-EB` (the slice versus EB), `Band Diagram (PAD cut)` and the kx–kz photoelectron trajectories. `Band Diagram (PAD cut)` is not a band structure at a fixed kz: it shows the bands at the k points the PAD slice actually samples, i.e. where EB = −E_n(kx, ky, kz(EB)), so it can be compared directly with `PAD Slice kx-EB`.
 
 ### 5. Reuse and save results
 
 Calculated structures, meshes, and PAD data are saved in the structure-specific `cache/` and `results/` directories. Pressing `Calc` again with the same conditions automatically reuses available caches. Use `計算結果を再読み込み` to refresh the result list.
 
 Settings are saved in files such as each structure's `parameter.json`. For external-computer processing, create an upload job from the `受け渡し` menu and import returned results from the download area.
+
+#### Restoring the last session
+
+On exit, the calculation target, every parameter in the sidebar, the selected tabs, the EB position and the window size are saved in `python/spadexp_4d.ini.json`. Each finished calculation is also written to `<calculation target>/cache/last_pad_result.h5`. At the next start, the same target is selected and its last PAD result is shown without recalculation. Gaussian dK/dE, EF shift, θmax and boundary changes made after the calculation are kept. If a PAD result file was open at exit, that file is shown instead.
+
+#### Saving and opening PAD results (HDF5)
+
+`File > Save PAD result as HDF5…` writes the displayed result to one HDF5 file. `File > Open PAD result (HDF5)…` shows it again, selects its calculation target and restores its parameters. If the target is not in the data folder, it can be added from the crystal structure stored in the file. The file contains:
+
+| Group | Contents |
+|---|---|
+| `/` (attributes) | `format = "SPADExp4D PAD result"`, `format_version`, `software`, `created`, `structure_name` |
+| `Settings` | all GUI and OpenMX settings as JSON (attribute `json`), plus each scalar setting as an attribute |
+| `PAD` | `binding_energy` (eV), `k` (Å⁻¹, shared by kx and ky), unbroadened `pad` and `band_weight` (EB, ky, kx; gzip), `nearest_eigenstate_distance`; attributes `v0_eV`, `request_json` |
+| `BandCut` | bands along the PAD slice: `k` and `energy` (E − EF, eV; NaN outside the slice) for lines, `points` (k, E − EF) where a band meets one k more than once or for a kz slice |
+| `Structure` | `cif`, `openmx_template` (`.openmx.base.dat`), `lattice` (Å), `reciprocal` (Å⁻¹) |
+| `Calculation` | k-space HDF5 path and size, OpenMX/conversion/PAD times, maximum sampling distance |
+
+Gaussian dK/dE are stored as settings and applied when the file is shown, so the stored PAD stays unbroadened. The k-space HDF5 (eigenstates) is not included; a new `Calc` with changed conditions needs it or recomputes it.
 
 ## Known limitations
 
@@ -215,7 +250,7 @@ Settings are saved in files such as each structure's `parameter.json`. For exter
 - OpenMX and its data files must be provided separately.
 - Large three-dimensional k-point grids can require substantial computation time and HDF5 storage.
 - Automatic CIF conversion does not support partial occupancy, disordered sites, or undefined elements.
-- Complete-band 4D caching for spin-polarized calculations is not currently supported.
+- `scf.SpinPolarization on` keeps the initial spin populations written by cif2omx (equal up and down). Magnetic order needs initial spins or a magnetic cell in `.openmx.base.dat`.
 
 ## Citation
 

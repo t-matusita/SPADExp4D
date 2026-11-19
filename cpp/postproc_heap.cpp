@@ -572,6 +572,7 @@ int main(int argc, const char** argv){
 	auto band_offset=[&](int ik, int ib){ return (size_t)ik*numBands_out+ib; };
 	double eigen_lowerTop=0; // largest eigenvalue of band minN-1
 	double eigen_upperBottom=0; // smallest eigenvalue of band maxN+1
+	bool lowerTop_set=false, upperBottom_set=false; // both spins at the first k point count
 
 	int digit=(spinPol_i==2)?4:2;
 	size_t lcao_count=(size_t)mo_count*numBands_out*totalOrbits;
@@ -689,12 +690,14 @@ int main(int argc, const char** argv){
 							Band_alloc[band_offset(kp_index-1, band_index-minN)]=eigen[i];
 						}
 						if(band_index==minN-1){
-							if(kp_index==1 || eigen[i]>eigen_lowerTop){
+							if(!lowerTop_set || eigen[i]>eigen_lowerTop){
+								lowerTop_set=true;
 								eigen_lowerTop=eigen[i];
 							}
 						}
 						if(band_index==maxN+1){
-							if(kp_index==1 || eigen[i]<eigen_upperBottom){
+							if(!upperBottom_set || eigen[i]<eigen_upperBottom){
+								upperBottom_set=true;
 								eigen_upperBottom=eigen[i];
 							}
 						}
@@ -718,12 +721,14 @@ int main(int argc, const char** argv){
 							}
 						}
 						if(band_index==minN-1){
-							if(kp_index==1 || eigen[i]>eigen_lowerTop){
+							if(!lowerTop_set || eigen[i]>eigen_lowerTop){
+								lowerTop_set=true;
 								eigen_lowerTop=eigen[i];
 							}
 						}
 						if(band_index==maxN+1){
-							if(kp_index==1 || eigen[i]<eigen_upperBottom){
+							if(!upperBottom_set || eigen[i]<eigen_upperBottom){
+								upperBottom_set=true;
 								eigen_upperBottom=eigen[i];
 							}
 						}
@@ -748,12 +753,14 @@ int main(int argc, const char** argv){
 							Band_alloc[band_offset(kp_index-1, band_index-minN)]=eigen[i];
 						}
 						if(band_index==minN-1){
-							if(kp_index==1 || eigen[i]>eigen_lowerTop){
+							if(!lowerTop_set || eigen[i]>eigen_lowerTop){
+								lowerTop_set=true;
 								eigen_lowerTop=eigen[i];
 							}
 						}
 						if(band_index==maxN+1){
-							if(kp_index==1 || eigen[i]<eigen_upperBottom){
+							if(!upperBottom_set || eigen[i]<eigen_upperBottom){
+								upperBottom_set=true;
 								eigen_upperBottom=eigen[i];
 							}
 						}
@@ -1020,6 +1027,16 @@ int main(int argc, const char** argv){
 	w_att_int(OutputG, "BandIndexStartZeroBased", minN);
 	w_att_int(OutputG, "BandIndexEndZeroBased", maxN);
 	w_att_int(OutputG, "BandCount", numBands_out);
+	w_att_int(OutputG, "TotalBandCount", numBands);
+	// Neighbouring bands outside [minN, maxN] over all k points (Hartree).  The
+	// Python band window uses them to prove that no state of its energy range
+	// was left out.
+	if(minN>0){
+		w_att_double(OutputG, "MaxEnergyBelowWindow_Eh", eigen_lowerTop);
+	}
+	if(maxN<numBands-1){
+		w_att_double(OutputG, "MinEnergyAboveWindow_Eh", eigen_upperBottom);
+	}
 	cout << endl;
 	delete[] Band_alloc;
 	delete[] BandUp_alloc;

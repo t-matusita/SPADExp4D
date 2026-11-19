@@ -273,7 +273,7 @@ void calculate_PAD(){
 		write_log((char*)"Error in spin");
 		return;
 	}
-	if(spin_i!=0)throw runtime_error("4D batch currently requires spin off");
+	// off: Band; on: BandUp/BandDn (both summed); nc: Band of spinor states.
 	//// Band dispersion
 	double** band; // [total_count][num_bands]
 	double** band_up;
@@ -295,6 +295,7 @@ void calculate_PAD(){
 	}else{
 		// on: use band_up and band_dn
 		s_data_2d(OutputG, "BandUp", &size1, &size2);
+		if(size1!=state_count)throw runtime_error("4D band state count mismatch");
 		num_bands=size2;
 		double* band_up_alloc=new double[size1*size2];
 		double* band_dn_alloc=new double[size1*size2];
@@ -3006,7 +3007,8 @@ void calculate_PAD(){
     // Only requested momenta and resident first-BZ indices change within this loop.
     for(size_t slice=0;slice<batch.eb.size();++slice){
         PA_E_min=PA_E_max=-batch.eb[slice];
-        batch.prepare(slice,k_points,band,num_bands,EF_Eh,Eh,au_ang);
+        batch.prepare(slice,k_points,spin_i==1?band_up:band,spin_i==1?band_dn:nullptr,
+                      num_bands,EF_Eh,Eh,au_ang);
         curved_reference_k_length=sqrt((PA_photon_energy+PA_inner_potential-batch.eb[slice])/batch.h2m)*au_ang;
         fill(dispersion2[0],dispersion2[0]+total_count_ext,0.0);
         auto kernel_start=spadexp4d::Clock::now();

@@ -32,6 +32,24 @@ STRUCTURE_RESULTS = None
 STRUCTURE_CACHE = None
 
 
+def set_structures_root(path):
+    """Use another data folder for structure inputs and every OpenMX output.
+
+    The selected Structure is cleared; call configure_structure() for a folder
+    inside the new root before running OpenMX again.
+    """
+    global STRUCTURES, DEFAULT_STRUCTURE, CACHE, TEMPLATE, RESTART
+    global STRUCTURE_RESULTS, STRUCTURE_CACHE
+    STRUCTURES = Path(path).expanduser().resolve()
+    DEFAULT_STRUCTURE = STRUCTURES / 'graphite'
+    CACHE = DEFAULT_STRUCTURE / 'cache'
+    TEMPLATE = DEFAULT_STRUCTURE / '.openmx.base.dat'
+    RESTART = CACHE / 'scf_rst'
+    STRUCTURE_RESULTS = None
+    STRUCTURE_CACHE = None
+    return STRUCTURES
+
+
 def configured_executable(environment, command):
     """Resolve a tool from an environment override, then PATH."""
     configured = os.environ.get(environment)
@@ -75,19 +93,21 @@ def template_has_undefined_species(path):
     return match is None or bool(re.search(r'\bundefined\b', match.group(1), flags=re.I))
 
 
-def complete_band_range(path):
+def complete_band_range(path, spin=None):
     """Return every zero-based band represented by an OpenMX basis.
 
-    For a non-spin calculation OpenMX has one band per atomic basis function.
-    No occupation or energy-window estimate is used, so unoccupied states above
-    EF remain available to PAD after an EF shift.
+    OpenMX has one band per atomic basis function for scf.SpinPolarization off,
+    the same count per spin for on, and two per basis function (spinors) for
+    NC.  `spin` overrides the template's setting.  No occupation estimate is
+    used, so unoccupied states above EF remain available after an EF shift.
     """
     text = Path(path).read_text(errors='replace')
-    spin_match = re.search(r'(?mi)^\s*scf\.SpinPolarization\s+(\S+)', text)
-    spin = spin_match.group(1).lower() if spin_match else 'off'
-    if spin != 'off':
-        raise ValueError('SPADExp4D full-band storage currently supports scf.SpinPolarization off.'
-                         f' Current setting: {spin}')
+    if spin is None:
+        spin_match = re.search(r'(?mi)^\s*scf\.SpinPolarization\s+(\S+)', text)
+        spin = spin_match.group(1) if spin_match else 'off'
+    spin = str(spin).lower()
+    if spin not in ('off', 'on', 'nc'):
+        raise ValueError(f'Unsupported scf.SpinPolarization: {spin}')
     species_match = re.search(
         r'<Definition\.of\.Atomic\.Species\s*(.*?)\s*Definition\.of\.Atomic\.Species>',
         text, flags=re.S)
@@ -120,6 +140,8 @@ def complete_band_range(path):
     count = sum(orbitals[label] for label in atom_labels)
     if count < 1:
         raise ValueError('OpenMX contains zero bands.')
+    if spin == 'nc':
+        count *= 2
     return (0, count - 1)
 
 
@@ -292,6 +314,231 @@ def divisions(settings):
     return tuple(values)
 
 
+# OpenMX keywords editable in the GUI (OpenMX Parameters tab).  Only values
+# that differ from the cif2omx template are stored, as OpenMX text under
+# "openmx" in the structure's parameter.json, and they are applied on top of
+# the template when the OpenMX input is written.  Without overrides the
+# input, the SCF restart and every cache identity are exactly as before.
+OPENMX_KEYWORDS = ('scf.XcType', 'scf.SpinPolarization', 'scf.SpinOrbit.Coupling',
+                   'scf.energycutoff', 'scf.Kgrid', 'scf.ElectronicTemperature',
+                   'scf.criterion', 'scf.maxIter')
+XC_TYPES = ('LDA', 'LSDA-CA', 'LSDA-PW', 'GGA-PBE')
+SPIN_MODES = ('off', 'on', 'NC')  # NC: non-collinear spinors (needed for spin-orbit coupling)
+# OpenMX's own defaults (Input_std.c), used when a template omits a keyword.
+OPENMX_DEFAULTS = {'scf.XcType': 'LDA', 'scf.SpinPolarization': 'off',
+                   'scf.SpinOrbit.Coupling': 'off', 'scf.energycutoff': '220',
+                   'scf.Kgrid': '4 4 4', 'scf.ElectronicTemperature': '300',
+                   'scf.criterion': '1e-06', 'scf.maxIter': '40'}
+
+
+def normalize_openmx_value(key, value):
+    """Return the canonical OpenMX text of one editable keyword value."""
+    if key not in OPENMX_KEYWORDS:
+        raise ValueError(f'Unsupported OpenMX keyword: {key}')
+    text = ' '.join(str(value).split())
+    try:
+        if key in ('scf.XcType', 'scf.SpinPolarization', 'scf.SpinOrbit.Coupling'):
+            choices = {'scf.XcType': XC_TYPES, 'scf.SpinPolarization': SPIN_MODES,
+                       'scf.SpinOrbit.Coupling': ('off', 'on')}[key]
+            match = {name.lower(): name for name in choices}.get(text.lower())
+            if match:
+                return match
+        elif key == 'scf.Kgrid':
+            numbers = [float(v) for v in text.split()]
+            if len(numbers) == 3 and all(v.is_integer() and 1 <= v <= 1000 for v in numbers):
+                return ' '.join(str(int(v)) for v in numbers)
+        elif key == 'scf.maxIter':
+            number = float(text)
+            if number.is_integer() and number >= 1:
+                return str(int(number))
+        else:
+            number = float(text)
+            if np.isfinite(number) and number > 0:
+                return f'{number:.10g}'
+    except ValueError:
+        pass
+    raise ValueError(f'Invalid value for {key}: {value!r}')
+
+
+def validate_openmx_overrides(values):
+    """Return the canonical {keyword: text} overrides, in keyword order."""
+    if values is None:
+        return {}
+    if not isinstance(values, dict):
+        raise ValueError('"openmx" must be a JSON object of OpenMX keywords.')
+    unknown = sorted(set(values) - set(OPENMX_KEYWORDS))
+    if unknown:
+        raise ValueError('Unsupported OpenMX keywords: ' + ', '.join(unknown))
+    return {key: normalize_openmx_value(key, values[key]) for key in OPENMX_KEYWORDS if key in values}
+
+
+def openmx_overrides(settings):
+    return validate_openmx_overrides((settings or {}).get('openmx'))
+
+
+def effective_openmx(overrides=None, path=None):
+    """Template keywords with overrides applied; checks spin/SOC consistency."""
+    values = {}
+    for key, text in template_keywords(path).items():
+        try:
+            values[key] = normalize_openmx_value(key, text if text is not None else OPENMX_DEFAULTS[key])
+        except ValueError:
+            values[key] = ' '.join(str(text).split())
+    values.update(validate_openmx_overrides(overrides))
+    if values['scf.SpinOrbit.Coupling'] == 'on' and values['scf.SpinPolarization'] != 'NC':
+        raise ValueError('scf.SpinOrbit.Coupling on requires scf.SpinPolarization NC.')
+    return values
+
+
+def request_band_range(overrides=None):
+    """All zero-based bands for the effective spin setting.
+
+    Unless the spin mode is overridden this is BANDS, the range configured for
+    the selected structure, so existing cache identities are unchanged.
+    """
+    spin = effective_openmx(overrides)['scf.SpinPolarization']
+    if spin == effective_openmx({})['scf.SpinPolarization']:
+        return BANDS
+    return complete_band_range(TEMPLATE, spin)
+
+
+def validate_band_window(window):
+    """Return None (store every band) or (low, high) in eV relative to EF."""
+    if window is None:
+        return None
+    try:
+        low, high = (float(v) for v in window)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('band_window must be null or [low, high] in eV relative to EF.') from exc
+    if not (np.isfinite(low) and np.isfinite(high) and low < high):
+        raise ValueError('band_window needs finite low < high (eV relative to EF).')
+    return (low, high)
+
+
+def band_window(settings):
+    return validate_band_window((settings or {}).get('band_window'))
+
+
+def _keyword_line(key):
+    return re.compile(rf'(?mi)^[ \t]*{re.escape(key)}[ \t]+([^#\n]*).*$')
+
+
+def template_keywords(path=None):
+    """Values of the editable keywords in an OpenMX template (None when absent)."""
+    text = Path(path or TEMPLATE).read_text(errors='replace')
+    values = {}
+    for key in OPENMX_KEYWORDS:
+        match = _keyword_line(key).search(text)
+        values[key] = ' '.join(match.group(1).split()) if match else None
+    return values
+
+
+RECOMMENDED_KGRID_SPACING = 0.2  # 1/A, SCF k-point spacing of the recommended scf.Kgrid
+
+
+def template_cell(path=None):
+    """Lattice vectors (rows, Angstrom) of an OpenMX template."""
+    text = Path(path or TEMPLATE).read_text(errors='replace')
+    block = re.search(r'<Atoms\.UnitVectors[ \t]*\n(.*?)\n[ \t]*Atoms\.UnitVectors>', text, re.S)
+    if block is None:
+        raise ValueError('Atoms.UnitVectors block not found in the OpenMX template.')
+    cell = np.array([[float(v) for v in line.split()[:3]]
+                     for line in block.group(1).strip().splitlines() if line.strip()])
+    if cell.shape != (3, 3):
+        raise ValueError('Atoms.UnitVectors must contain three vectors.')
+    unit = re.search(r'(?mi)^[ \t]*Atoms\.UnitVectors\.Unit[ \t]+(\S+)', text)
+    return cell * 0.529177 if unit and unit.group(1).lower() == 'au' else cell
+
+
+def recommended_openmx_values(path=None):
+    """Recommended SCF keywords for a template's cell, never weaker than the template.
+
+    scf.Kgrid uses a spacing of at most RECOMMENDED_KGRID_SPACING; the cutoff is
+    at least 220 Ry, the criterion at most 1e-6 Hartree and maxIter at least
+    200.  scf.XcType stays as in the template, which matches its pseudopotentials.
+    """
+    template = template_keywords(path)
+
+    def number(key, fallback):
+        try:
+            return float(normalize_openmx_value(key, template[key]))
+        except ValueError:
+            return fallback
+
+    reciprocal = 2 * np.pi * np.linalg.inv(template_cell(path)).T
+    grid = [max(1, int(np.ceil(np.linalg.norm(g) / RECOMMENDED_KGRID_SPACING - 1e-9))) for g in reciprocal]
+    try:
+        current = [int(v) for v in normalize_openmx_value('scf.Kgrid', template['scf.Kgrid']).split()]
+        grid = [max(new, old) for new, old in zip(grid, current)]
+    except ValueError:
+        pass
+    try:
+        xc = normalize_openmx_value('scf.XcType', template['scf.XcType'])
+    except ValueError:
+        xc = 'GGA-PBE'
+
+    def kept(key):  # spin settings define the physics model: keep the template's
+        try:
+            return normalize_openmx_value(key, template[key])
+        except ValueError:
+            return OPENMX_DEFAULTS[key]
+
+    values = {'scf.XcType': xc,
+              'scf.SpinPolarization': kept('scf.SpinPolarization'),
+              'scf.SpinOrbit.Coupling': kept('scf.SpinOrbit.Coupling'),
+              'scf.energycutoff': max(number('scf.energycutoff', 220.0), 220.0),
+              'scf.Kgrid': ' '.join(map(str, grid)),
+              'scf.ElectronicTemperature': 300,
+              'scf.criterion': min(number('scf.criterion', 1e-6), 1e-6),
+              'scf.maxIter': max(number('scf.maxIter', 200), 200)}
+    return {key: normalize_openmx_value(key, values[key]) for key in OPENMX_KEYWORDS}
+
+
+def complete_noncollinear_atoms(text):
+    """Give every atom line the explicit NC columns OpenMX reads.
+
+    For scf.SpinPolarization NC OpenMX sscanf()s spin/orbital angles, a
+    constraint flag and orbital polarization after the up/down populations;
+    absent fields would keep undefined values.  cif2omx writes only
+    "id species x y z up down", so append "0 0 0 0 0 off" (no constraint).
+    """
+    match = re.search(r'(<Atoms\.SpeciesAndCoordinates[^\n]*\n)(.*?)(\n[ \t]*Atoms\.SpeciesAndCoordinates>)',
+                      text, re.S)
+    if match is None:
+        return text
+    lines = []
+    for line in match.group(2).split('\n'):
+        fields = line.split('#', 1)[0].split()
+        lines.append(f'{line.rstrip()}  0.0 0.0 0.0 0.0 0 off'
+                     if len(fields) == 7 and fields[0].isdigit() else line)
+    return text[:match.start(2)] + '\n'.join(lines) + text[match.end(2):]
+
+
+def apply_openmx_overrides(text, overrides):
+    """Replace (or append) the overridden keyword lines of an OpenMX input."""
+    for key, value in (overrides or {}).items():
+        line = f'{key} {value}'
+        pattern = _keyword_line(key)
+        if pattern.search(text):
+            text = pattern.sub(lambda _match: line, text, count=1)
+        else:
+            text = text.rstrip('\n') + f'\n{line}\n'
+    return text
+
+
+def scf_restart_folder(overrides=None):
+    """SCF restart that belongs to the template plus these keyword overrides.
+
+    Without overrides this is the structure's existing restart.  Overrides
+    (another cutoff, functional, ...) get their own folder, so a restart made
+    with different SCF settings is never reused through scf.restart pp.
+    """
+    if not overrides:
+        return RESTART
+    identity = hashlib.sha256((digest(TEMPLATE) + json.dumps(overrides, sort_keys=True)).encode())
+    return RESTART.with_name(f'{RESTART.name}_{identity.hexdigest()[:16]}')
+
+
 def mesh_request(settings):
     # No photoemission / plotting parameter enters this identity. These fixed
     # physical fingerprints only guard against reusing a different material.
@@ -299,13 +546,21 @@ def mesh_request(settings):
         raise FileNotFoundError(
             'Please set the path to the OpenMX executable. '
             'Use SPADEXP4D_OPENMX or add openmx to PATH.')
-    return {'schema': SCHEMA, 'divisions': list(divisions(settings)), 'lattice': LATTICE.tolist(),
-            'bands': list(BANDS), 'template': digest(TEMPLATE),
-            'data': {str(p.relative_to(DATA)): digest(p) for p in sorted(DATA.rglob('*')) if p.is_file()},
-            'restart': (RESTART_FINGERPRINT if RESTART_FINGERPRINT is not None else
-                        ([stamp(p) for p in sorted(RESTART.iterdir()) if p.is_file()]
-                         if RESTART.is_dir() else [])),
-            'openmx': stamp(OPENMX), 'scf_restart': 'pp'}
+    overrides = openmx_overrides(settings)
+    window = band_window(settings)
+    restart = scf_restart_folder(overrides)
+    request = {'schema': SCHEMA, 'divisions': list(divisions(settings)), 'lattice': LATTICE.tolist(),
+               'bands': list(request_band_range(overrides)), 'template': digest(TEMPLATE),
+               'data': {str(p.relative_to(DATA)): digest(p) for p in sorted(DATA.rglob('*')) if p.is_file()},
+               'restart': (RESTART_FINGERPRINT if RESTART_FINGERPRINT is not None else
+                           ([stamp(p) for p in sorted(restart.iterdir()) if p.is_file()]
+                            if restart.is_dir() else [])),
+               'openmx': stamp(OPENMX), 'scf_restart': 'pp'}
+    if overrides:  # absent when unchanged, so existing cache identities stay valid
+        request['openmx_keywords'] = overrides
+    if window is not None:  # likewise absent when every band is stored
+        request['band_window'] = list(window)
+    return request
 
 
 def request_code(request):
@@ -350,11 +605,21 @@ def file_lock(path):
 MO_CUBE_KEYS = ('num.HOMOs', 'num.LUMOs')
 
 
-def input_text(stem, points):
-    text = TEMPLATE.read_text()
+def input_text(stem, points, openmx=None):
+    overrides = validate_openmx_overrides(openmx)
+    bands = request_band_range(overrides)
+    text = apply_openmx_overrides(TEMPLATE.read_text(), overrides)
+    if effective_openmx(overrides)['scf.SpinPolarization'] == 'NC':
+        text = complete_noncollinear_atoms(text)
     text = re.sub(r'(?m)^System\.Name\s+\S+', f'System.Name {stem}', text)
     text = re.sub(r'(?m)^DATA\.PATH\s+.*$', f'DATA.PATH {DATA}', text)
-    restart_file = RESTART / f'{RESTART_NAME}.crst_check'
+    # OpenMX switches to the Cluster solver for a Gamma-only SCF grid.  That
+    # solver rejects the multiple MO.kpoint entries used by the mesh batches,
+    # so keep a non-Gamma SCF grid when the CIF converter emitted 1 1 1.
+    if len(points) > 1:
+        text = re.sub(r'(?m)^scf\.Kgrid\s+1\s+1\s+1\s*$',
+                      'scf.Kgrid 2 2 1', text)
+    restart_file = scf_restart_folder(overrides) / f'{RESTART_NAME}.crst_check'
     restart_block = (f'scf.restart pp\nscf.restart.filename {RESTART_NAME}\norbitalOpt.Force.Skip on'
                      if restart_file.is_file() else 'scf.restart on')
     if re.search(r'(?m)^scf\.restart\s+', text):
@@ -365,7 +630,7 @@ def input_text(stem, points):
     # the batch length; no fictitious line is sent through the preprocessor.
     block = (f'SPADExp.dimension 1\nSPADExp.curved false\nSPADExp.origin 0 0 0\n'
              f'<SPADExp.range\n 1 0 0 0 1 {len(points)}\nSPADExp.range>\n'
-             f'SPADExp.minN {BANDS[0]}\nSPADExp.maxN {BANDS[1]}')
+             f'SPADExp.minN {bands[0]}\nSPADExp.maxN {bands[1]}')
     if re.search(r'SPADExp\.dimension.*?SPADExp\.maxN\s+\d+', text, flags=re.S):
         text = re.sub(r'SPADExp\.dimension.*?SPADExp\.maxN\s+\d+', block, text, count=1, flags=re.S)
     else:
@@ -392,6 +657,22 @@ def lcao_paths(file):
     return sorted(paths)
 
 
+def spin_of(file):
+    """Spin mode of a converted file: 'off', 'on' or 'nc'."""
+    value = file['Output'].attrs['Spin']
+    return (value.decode() if isinstance(value, (bytes, np.bytes_)) else str(value)).lower()
+
+
+def band_paths(spin):
+    """Eigenvalue datasets: up and down sets for collinear spin, else one set."""
+    return ['Output/BandUp', 'Output/BandDn'] if str(spin).lower() == 'on' else ['Output/Band']
+
+
+def stored_band_range(file):
+    output = file['Output'].attrs
+    return (int(output['BandIndexStartZeroBased']), int(output['BandIndexEndZeroBased']))
+
+
 def expected_lcao_paths(file):
     """Build the expected radial-orbital dataset list from OpenMX input data."""
     def text(value):
@@ -401,6 +682,7 @@ def expected_lcao_paths(file):
     species_orbits = [text(value) for value in file['Input/Atomic.Species/Orbits'][:]]
     orbit_by_species = dict(zip(species_labels, species_orbits))
     atom_labels = [text(value) for value in file['Input/Atoms.SpeciesAndCoordinates/Labels'][:]]
+    suffixes = ('Up', 'Dn') if spin_of(file) == 'on' else ('',)
     expected = []
     for atom_index, label in enumerate(atom_labels, 1):
         orbit_text = orbit_by_species[label]
@@ -409,25 +691,48 @@ def expected_lcao_paths(file):
             raise ValueError(f'Unrecognized OpenMX basis: {label} {orbit_text}')
         for kind, count in orbit_groups:
             for radial_index in range(int(count)):
-                expected.append(f'Output/LCAO/{atom_index}_{label}/{kind}{radial_index}')
+                for suffix in suffixes:
+                    expected.append(f'Output/LCAO/{atom_index}_{label}/{kind}{radial_index}{suffix}')
     return sorted(expected)
 
 
-def states_ok(file, count, compressed=False):
+def states_ok(file, count, compressed=False, band_range=None, spin=None):
+    """Check a converted or cached eigenstate file.
+
+    band_range defaults to BANDS; pass False to accept the stored range (band
+    window).  spin is the expected mode ('off', 'on', 'nc'; default: off,
+    as before spin support).
+    """
     try:
-        band_count = BANDS[1] - BANDS[0] + 1
+        if band_range is None:
+            band_range = BANDS
+        expected_spin = 'off' if spin is None else str(spin).lower()
+        start, end = stored_band_range(file)
+        band_count = end - start + 1
+        mode = spin_of(file)
+        digit = 4 if mode == 'nc' else 2
         paths = lcao_paths(file)
-        return (file['Output/Band'].shape == (count, band_count)
-                and str(file['Output'].attrs['Spin']) == 'off'
-                and int(file['Output'].attrs['BandIndexStartZeroBased']) == BANDS[0]
-                and int(file['Output'].attrs['BandIndexEndZeroBased']) == BANDS[1]
+        return (mode == expected_spin and band_count >= 1
+                and (band_range is False or (start, end) == tuple(band_range))
+                and all(file[path].shape == (count, band_count) for path in band_paths(mode))
                 and paths == expected_lcao_paths(file)
-                and all(file[p].shape[:2] == (count, band_count) and file[p].shape[-1] == 2
+                and all(file[p].shape[:2] == (count, band_count) and file[p].shape[-1] == digit
                         and (not compressed or (file[p].dtype == np.float32 and file[p].compression == 'gzip'))
                         for p in paths)
                 and 'Output/Potential/V0' in file)
     except (KeyError, ValueError, OSError):
         return False
+
+
+def request_spin(request):
+    """Spin mode ('off', 'on', 'nc') that a mesh request stores."""
+    return effective_openmx(request.get('openmx_keywords'))['scf.SpinPolarization'].lower()
+
+
+def request_states_ok(file, request, count, compressed=False):
+    window = request.get('band_window')
+    bands = tuple(request['bands']) if 'bands' in request else None  # None: BANDS
+    return states_ok(file, count, compressed, False if window else bands, request_spin(request))
 
 
 def cache_ok(path, request):
@@ -437,7 +742,7 @@ def cache_ok(path, request):
             return (bool(f.attrs.get('Complete', False))
                     and f.attrs.get('Request') == json.dumps(request, sort_keys=True)
                     and f['Mesh/FirstBZCoordinates'].shape == (count, 3)
-                    and np.all(f['Mesh/CompletedChunks'][:]) and states_ok(f, count, True))
+                    and np.all(f['Mesh/CompletedChunks'][:]) and request_states_ok(f, request, count, True))
     except (OSError, ValueError, KeyError):
         return False
 
@@ -478,21 +783,73 @@ def completed_openmx(folder, stem, text):
         return False
 
 
-def preserve_structure_restart(folder, stem):
-    """Keep one reusable SCF restart beside the selected structure."""
-    if STRUCTURE_CACHE is None or RESTART.parent != STRUCTURE_CACHE:
+def preserve_structure_restart(folder, stem, restart=None):
+    """Keep one reusable SCF restart (per keyword set) beside the structure."""
+    restart = Path(restart) if restart is not None else RESTART
+    if STRUCTURE_CACHE is None or restart.parent != STRUCTURE_CACHE:
         return
     source = Path(folder) / f'{stem}_rst'
-    if not source.is_dir() or RESTART.is_dir():
+    if not source.is_dir() or restart.is_dir():
         return
-    temporary = RESTART.with_name(RESTART.name + '.tmp')
+    temporary = restart.with_name(restart.name + '.tmp')
     if temporary.exists():
         raise RuntimeError(f'A temporary resume folder remains: {temporary}')
     shutil.copytree(source, temporary)
     for path in sorted(temporary.iterdir()):
         if path.name.startswith(stem):
             path.rename(path.with_name(RESTART_NAME + path.name[len(stem):]))
-    temporary.replace(RESTART)
+    temporary.replace(restart)
+
+
+EH_EV = 27.211386245988
+BAND_WINDOW_MARGIN_EV = 1.0  # extra range when choosing bands from the SCF k grid
+
+
+def scf_band_extrema(out_path):
+    """EF and per-band (min, max) eigenvalues over SCF k points and spins (Hartree)."""
+    ef = None; extrema = {}; inside = seen = False
+    row = re.compile(r'\s*(\d+)((?:\s+-?\d+\.\d+(?:[eE][-+]?\d+)?)+)\s*$')
+    with Path(out_path).open(errors='replace') as stream:
+        for line in stream:
+            if not inside:
+                inside = 'Eigenvalues (Hartree) of SCF KS-eq.' in line
+                continue
+            if ef is None:
+                match = re.search(r'Chemical Potential \(Hartree\)\s*=\s*(\S+)', line)
+                if match:
+                    ef = float(match.group(1))
+                continue
+            match = row.match(line)
+            if match:
+                seen = True
+                band = int(match.group(1)) - 1
+                values = [float(v) for v in match.group(2).split()]
+                low, high = extrema.get(band, (np.inf, -np.inf))
+                extrema[band] = (min(low, *values), max(high, *values))
+            elif seen and '****' in line:
+                break
+    if ef is None or not extrema:
+        raise RuntimeError(f'SCF eigenvalues not found in {out_path}')
+    return ef, extrema
+
+
+def window_band_indices(out_path, window, full):
+    """Zero-based band range whose SCF energies reach the window (plus margin)."""
+    ef, extrema = scf_band_extrema(out_path)
+    low = ef + (window[0] - BAND_WINDOW_MARGIN_EV) / EH_EV
+    high = ef + (window[1] + BAND_WINDOW_MARGIN_EV) / EH_EV
+    bands = [band for band, (lo, hi) in extrema.items()
+             if hi >= low and lo <= high and full[0] <= band <= full[1]]
+    return (min(bands), max(bands)) if bands else tuple(full)
+
+
+def window_coverage(raw_path, window):
+    """(low_ok, high_ok): no band outside the stored range enters the window."""
+    with h5py.File(raw_path, 'r') as f:
+        attrs = f['Output'].attrs; ef = float(attrs['EF_Eh'])
+        below = attrs.get('MaxEnergyBelowWindow_Eh'); above = attrs.get('MinEnergyAboveWindow_Eh')
+    return (below is None or (float(below) - ef) * EH_EV < window[0],
+            above is None or (float(above) - ef) * EH_EV > window[1])
 
 
 def ensure_postprocessor(log=None, stop=None):
@@ -504,11 +861,22 @@ def ensure_postprocessor(log=None, stop=None):
                     on_output=log, stop=stop)
 
 
-def calculate_chunk(folder, points, log=None, stop=None, conversion=None):
+def calculate_chunk(folder, points, log=None, stop=None, conversion=None, openmx=None, window=None):
     ensure_postprocessor(log, stop)
     folder.mkdir(parents=True, exist_ok=True)
     stem = folder.name; dat = folder / f'{stem}.dat'; raw = folder / f'{stem}.hdf5'
-    text = input_text(stem, points)
+    overrides = validate_openmx_overrides(openmx)
+    window = validate_band_window(window)
+    full = request_band_range(overrides)
+    spin = effective_openmx(overrides)['scf.SpinPolarization'].lower()
+    restart = scf_restart_folder(overrides)
+    text = input_text(stem, points, overrides)
+
+    def converted_ok(f):
+        stored = json_read(folder / 'conversion.json') or {}
+        return (states_ok(f, len(points), False, False if window else full, spin)
+                and (window is None or stored.get('band_window') == list(window))
+                and np.allclose(f['Input/Kpath/Coordinates'][:], points, rtol=0, atol=2e-11))
     check_stop(stop)
     elapsed = 0.0
     conversion_elapsed = 0.0
@@ -517,20 +885,18 @@ def calculate_chunk(folder, points, log=None, stop=None, conversion=None):
     # OpenMX output, so a postprocessing retry can never trigger recomputation.
     try:
         with h5py.File(raw, 'r') as existing:
-            raw_valid = (states_ok(existing, len(points))
-                         and np.allclose(existing['Input/Kpath/Coordinates'][:], points,
-                                         rtol=0, atol=2e-11))
+            raw_valid = converted_ok(existing)
     except (OSError, KeyError, ValueError):
         raw_valid = False
     if raw_valid:
         return raw, elapsed, conversion_elapsed
     if not completed_openmx(folder, stem, text):
-        restart_file = RESTART / f'{RESTART_NAME}.crst_check'
+        restart_file = restart / f'{RESTART_NAME}.crst_check'
         if restart_file.is_file():
             link = folder / f'{RESTART_NAME}_rst'
             if not link.exists():
-                link.symlink_to(RESTART, target_is_directory=True)
-            if not link.is_symlink() or link.resolve() != RESTART.resolve():
+                link.symlink_to(restart, target_is_directory=True)
+            if not link.is_symlink() or link.resolve() != restart.resolve():
                 raise RuntimeError(f'Unexpected restart path: {link}')
         (folder / 'openmx.json').unlink(missing_ok=True)
         (folder / f'{stem}.out').unlink(missing_ok=True)
@@ -548,13 +914,15 @@ def calculate_chunk(folder, points, log=None, stop=None, conversion=None):
             raise RuntimeError('Could not verify normal OpenMX completion.')
         json_write(folder / 'openmx.json', {'input': hashlib.sha256(text.encode()).hexdigest(),
                                            'output': stamp(folder / f'{stem}.out')})
-    preserve_structure_restart(folder, stem)
+    preserve_structure_restart(folder, stem, restart)
     conversion_record = {'output': stamp(folder / f'{stem}.out'), 'postprocessor': stamp(POSTPROC)}
+    if window is not None:
+        conversion_record['band_window'] = list(window)
     valid = False
     try:
         with h5py.File(raw, 'r') as f:
-            valid = (states_ok(f, len(points)) and json_read(folder / 'conversion.json') == conversion_record
-                     and np.allclose(f['Input/Kpath/Coordinates'][:], points, rtol=0, atol=2e-11))
+            stored = {k: v for k, v in (json_read(folder / 'conversion.json') or {}).items() if k != 'bands'}
+            valid = converted_ok(f) and stored == conversion_record
     except (OSError, KeyError, ValueError):
         pass
     if not valid:
@@ -569,18 +937,44 @@ def calculate_chunk(folder, points, log=None, stop=None, conversion=None):
                 for current, total in re.findall(r'SPADExp conversion: kpoint=(\d+)/(\d+)', text):
                     conversion(int(current), int(total))
         conversion_started = time.monotonic()
-        run_command([POSTPROC, dat], folder / 'postproc.log', folder, expected=raw,
-                    on_output=postproc_output, stop=stop)
+        if window is None:
+            run_command([POSTPROC, dat], folder / 'postproc.log', folder, expected=raw,
+                        on_output=postproc_output, stop=stop)
+        else:
+            # Convert only the bands that can reach the window.  The converter
+            # reports the neighbouring band edges over every k point; widen and
+            # convert again (OpenMX is not rerun) until none enters the window.
+            low, high = window_band_indices(folder / f'{stem}.out', window, full)
+            step = 4
+            while True:
+                if log:
+                    log(f'[Band window] {window[0]:g} to {window[1]:g} eV: storing bands '
+                        f'{low}–{high} of {full[0]}–{full[1]}')
+                window_dat = folder / f'{stem}.window.dat'
+                window_dat.write_text(re.sub(r'(?m)^SPADExp\.maxN\s+\d+', f'SPADExp.maxN {high}',
+                                             re.sub(r'(?m)^SPADExp\.minN\s+\d+', f'SPADExp.minN {low}', text)))
+                raw.unlink(missing_ok=True)
+                run_command([POSTPROC, window_dat], folder / 'postproc.log', folder, expected=raw,
+                            on_output=postproc_output, stop=stop)
+                low_ok, high_ok = window_coverage(raw, window)
+                wider = (low if low_ok else max(full[0], low - step),
+                         high if high_ok else min(full[1], high + step))
+                if (low_ok and high_ok) or wider == (low, high):
+                    break
+                low, high = wider; step *= 2
+            conversion_record['bands'] = [low, high]
         conversion_elapsed = time.monotonic() - conversion_started
         with h5py.File(raw, 'r') as f:
-            if not states_ok(f, len(points)) or not np.allclose(f['Input/Kpath/Coordinates'][:], points, rtol=0, atol=2e-11):
+            if not (states_ok(f, len(points), False, False if window else full, spin)
+                    and np.allclose(f['Input/Kpath/Coordinates'][:], points, rtol=0, atol=2e-11)):
                 raise RuntimeError(f'Incomplete eigenstates: {raw}')
         json_write(folder / 'conversion.json', conversion_record)
     return raw, elapsed, conversion_elapsed
 
 
 def initialize_database(file, raw, count):
-    band_count = BANDS[1] - BANDS[0] + 1
+    start, end = stored_band_range(raw)
+    band_count = end - start + 1
     for key, value in raw.attrs.items():
         file.attrs[key] = value
     inp = file.create_group('Input')
@@ -588,8 +982,9 @@ def initialize_database(file, raw, count):
         raw.copy('Input/' + name, inp, name=name)
     out = file.create_group('Output'); out.attrs.update(raw['Output'].attrs)
     raw.copy('Output/Potential', out, name='Potential')
-    out.create_dataset('Band', shape=(count, band_count), dtype='f8',
-                       chunks=(min(256, count), band_count), compression='gzip', shuffle=True)
+    for path in band_paths(spin_of(raw)):
+        out.create_dataset(path.rsplit('/', 1)[1], shape=(count, band_count), dtype='f8',
+                           chunks=(min(256, count), band_count), compression='gzip', shuffle=True)
     for path in lcao_paths(raw):
         dataset = raw[path]
         shape = (count,) + dataset.shape[1:]
@@ -600,6 +995,8 @@ def initialize_database(file, raw, count):
 
 def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, timing=None):
     plan = mesh_plan(settings); request = plan['request']; folder = plan['folder']; final = plan['path']
+    overrides = openmx_overrides(settings)
+    window = band_window(settings)
     folder.mkdir(parents=True, exist_ok=True)
     with file_lock(folder / 'mesh.lock'):
         if cache_ok(final, request):
@@ -613,7 +1010,7 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                 reuse_partial = (f.attrs['Request'] == json.dumps(request, sort_keys=True)
                                  and f['Mesh/CompletedChunks'].shape == (batches,)
                                  and f['Mesh/FirstBZCoordinates'].shape == (count, 3)
-                                 and ('Output' not in f or states_ok(f, count, True)))
+                                 and ('Output' not in f or request_states_ok(f, request, count, True)))
         except (OSError, KeyError):
             pass
         if not reuse_partial:
@@ -632,13 +1029,19 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                 with h5py.File(raw_path, 'r') as raw:
                     if 'Output' not in f:
                         initialize_database(f, raw, count)
+                        if window is not None:
+                            f['Output'].attrs['BandWindow_eV'] = window
+                    if (spin_of(f) != spin_of(raw)
+                            or stored_band_range(f) != stored_band_range(raw)):
+                        raise RuntimeError('Spin mode or stored band range differs between OpenMX batches.')
                     if not np.isclose(f['Output'].attrs['EF_Eh'], raw['Output'].attrs['EF_Eh'], rtol=0, atol=1e-8):
                         raise RuntimeError('The SCF Fermi energy does not match the saved data.')
                     row = 0
                     for batch in selected:
                         start = batch * CHUNK_POINTS; end = min(count, start + CHUNK_POINTS)
                         check_stop(stop)
-                        f['Output/Band'][start:end] = raw['Output/Band'][row:row+end-start]
+                        for path in band_paths(spin_of(raw)):
+                            f[path][start:end] = raw[path][row:row+end-start]
                         for path in lcao_paths(raw):
                             check_stop(stop)
                             f[path][start:end] = raw[path][row:row+end-start].astype(np.float32)
@@ -661,7 +1064,7 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                     continue
                 start = batch * CHUNK_POINTS; end = min(count, start + CHUNK_POINTS)
                 points = grid_points(ns, start, end)
-                if completed_openmx(legacy, legacy.name, input_text(legacy.name, points)):
+                if completed_openmx(legacy, legacy.name, input_text(legacy.name, points, overrides)):
                     if log: log(f'[Reusing old OpenMX output] k points {start+1:,}–{end:,}')
                     completed_before = sum(min(CHUNK_POINTS, count - i * CHUNK_POINTS)
                                            for i in np.flatnonzero(f['Mesh/CompletedChunks'][:]))
@@ -669,7 +1072,7 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                         if conversion:
                             conversion(completed_before, end - start, current, total, count)
                     raw_path, seconds, conversion_seconds = calculate_chunk(
-                        legacy, points, log, stop, conversion_progress)
+                        legacy, points, log, stop, conversion_progress, overrides, window)
                     elapsed += seconds
                     import_started = time.monotonic()
                     store_raw(raw_path, np.array([batch]), points)
@@ -695,7 +1098,7 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                     if conversion:
                         conversion(completed_before, len(points), current, total, count)
                 raw_path, seconds, conversion_seconds = calculate_chunk(
-                    job, points, log, stop, conversion_progress)
+                    job, points, log, stop, conversion_progress, overrides, window)
                 elapsed += seconds
                 import_started = time.monotonic()
                 store_raw(raw_path, pending, points)
@@ -748,6 +1151,9 @@ class EigenstateGrid:
         self.ef = float(self.file['Output'].attrs['EF_Eh'])
         # Cell used by OpenMX and by the PAD engine for fractional -> Cartesian.
         self.reciprocal = openmx_reciprocal(self.file)
+        self.spin = spin_of(self.file)
+        self.band_paths = band_paths(self.spin)
+        self.band_range = stored_band_range(self.file)
 
     def close(self):
         self.file.close()
@@ -779,9 +1185,13 @@ class EigenstateGrid:
         unique, inverse = np.unique(indices, return_inverse=True)
         return self.file[path][unique][inverse]
 
+    def band_values(self, indices):
+        """Stored eigenvalues (Hartree); up and down sets side by side for spin on."""
+        return np.concatenate([self.take(path, indices) for path in self.band_paths], axis=1)
+
     def bands(self, cartesian):
         indices, error = self.lookup(cartesian)
-        return (self.take('Output/Band', indices) - self.ef) * 27.211386245988, error
+        return (self.band_values(indices) - self.ef) * 27.211386245988, error
 
     def interpolated_bands(self, cartesian):
         """Periodically trilinear-interpolate scalar eigenvalues on the mesh.
@@ -799,7 +1209,7 @@ class EigenstateGrid:
             index3 = (lower + offset) % self.ns
             indices = np.ravel_multi_index(index3.T, tuple(self.ns))
             weight = np.prod(np.where(offset, fraction, 1.0-fraction), axis=1)
-            corner = self.take('Output/Band', indices)
+            corner = self.band_values(indices)
             if values is None:
                 values = np.zeros_like(corner, dtype=float)
             values += weight[:, None] * corner
@@ -822,7 +1232,8 @@ class EigenstateGrid:
                 for name in ('Atomic.Species', 'Atoms.SpeciesAndCoordinates', 'UnitCells'):
                     self.file.copy('Input/' + name, inp, name=name)
                 k = inp.create_group('Kpath'); k.attrs.update(attrs)
-                k.attrs.update(Count=len(indices), minN=BANDS[0], maxN=BANDS[1], FirstBZFolded=np.uint8(1),
+                k.attrs.update(Count=len(indices), minN=self.band_range[0], maxN=self.band_range[1],
+                               FirstBZFolded=np.uint8(1),
                                UniqueCount=len(np.unique(indices)), StateSampling='periodic nearest neighbour')
                 k.create_dataset('Coordinates',
                                  data=np.asarray(cartesian) @ np.linalg.inv(self.reciprocal))
@@ -831,7 +1242,8 @@ class EigenstateGrid:
                 k.create_dataset('SamplingDistance_Ainv', data=errors)
                 group = out.create_group('Output'); group.attrs.update(self.file['Output'].attrs)
                 self.file.copy('Output/Potential', group, name='Potential')
-                group.create_dataset('Band', data=self.take('Output/Band', indices))
+                for path in self.band_paths:
+                    group.create_dataset(path.rsplit('/', 1)[1], data=self.take(path, indices))
                 for path in self.paths:
                     parent, name = path.rsplit('/', 1)
                     out.require_group(parent).create_dataset(name, data=self.take(path, indices),

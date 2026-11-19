@@ -68,19 +68,26 @@ struct BatchGrid {
             if(d<best-1e-14){best=d;bx=ix;by=iy;}}
         error=std::sqrt(best);return (wrap(bx,n[0])*n[1]+wrap(by,n[1]))*n[2]+wrap(iz,n[2]);
     }
-    void prepare(size_t slice,double (*points)[3],double** band,int nb,double ef,double eh,double au_ang) {
+    // band_dn is the down-spin set for collinear spin (nullptr otherwise);
+    // weights count the states of both sets.
+    void prepare(size_t slice,double (*points)[3],double** band,double** band_dn,int nb,
+                 double ef,double eh,double au_ang) {
         max_distance=0;double kt2=(hv+v0-eb[slice])/h2m;
         for(int iy=0;iy<ny;++iy)for(int ix=0;ix<nx;++ix){int i=iy*nx+ix;
             double x=kmin+(kmax-kmin)*ix/(nx-1),y=kmin+(kmax-kmin)*iy/(ny-1),z2=kt2-x*x-y*y;
             double z=std::sqrt(std::max(z2,0.0));points[i][0]=x*au_ang;points[i][1]=y*au_ang;points[i][2]=z*au_ang;
             index[i]=lookup(x,y,z,distance[i]);max_distance=std::max(max_distance,distance[i]);weights[i]=0;
-            if(z2>=0)for(int b=0;b<nb;++b){
-                if(raw_spectrum){
-                    double pixel=((band[index[i]][b]-ef)*eh+eb[slice])/energy_step;
-                    if(std::floor(pixel+0.5)==0)weights[i]+=1.0/energy_step;
-                }else{
-                    double delta=((band[index[i]][b]-ef)*band_eh+eb[slice])/de;
-                    weights[i]+=std::exp(-0.5*delta*delta);
+            if(z2<0)continue;
+            for(double** set:{band,band_dn}){
+                if(set==nullptr)continue;
+                for(int b=0;b<nb;++b){
+                    if(raw_spectrum){
+                        double pixel=((set[index[i]][b]-ef)*eh+eb[slice])/energy_step;
+                        if(std::floor(pixel+0.5)==0)weights[i]+=1.0/energy_step;
+                    }else{
+                        double delta=((set[index[i]][b]-ef)*band_eh+eb[slice])/de;
+                        weights[i]+=std::exp(-0.5*delta*delta);
+                    }
                 }
             }
         }

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """4-D (kx, ky, kz, E) viewer using a reusable first-BZ eigenstate database."""
 
-# SPADExp4D 1.1.0: integrated Python, C++ and per-Structure caches.
+# SPADExp4D 1.2.0: integrated Python, C++ and per-Structure caches.
 
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import hashlib
@@ -72,6 +72,12 @@ H2M = 3.80998211615486  # hbar^2/(2m), eV Angstrom^2
 
 K_HALF, K_LIMIT, DK = 3.0, 10.0, 0.075
 POLARIZATIONS = ("lx", "ly", "c+", "c-", "unpolarized")
+# Beamline presets for the Euler angles (a, b, c) in degrees, offered by the
+# "Incident Angles (zyz Euler)" button.  a and c may be negative (-360 to 360).
+EULER_PRESETS = (
+    ("SPring-8 BL25SU", (0.0, 90.0, -90.0)),
+    ("UVSOR PMM", (0.0, 68.0, -90.0)),
+)
 
 DEFAULT_SETTINGS = {
     "hv": 21.2, "v0": 20.0, "ef_shift": 0.0, "wfnc": 4.0,
@@ -90,6 +96,89 @@ SETTING_KEYS = (
     "k_min", "k_max", "k_step", "show_bz", "use_first_bz_only", "N1", "N2", "N3",
 )
 
+# Application-level keys kept only in INITIAL_SETTINGS_FILE.  They are not PAD
+# parameters, so validate_settings() drops them and write_settings() restores
+# them when it rewrites the initialization file.
+DATA_FOLDER_KEY = "data_folder"
+# Window state restored at the next start: calculation target, EB position,
+# selected tabs and window geometry (see Window.save_session).
+SESSION_KEY = "session"
+APP_SETTING_KEYS = (DATA_FOLDER_KEY, SESSION_KEY)
+DEFAULT_DATA_FOLDER = PROJECT / "structures"
+
+# Self-contained PAD result files (HDF5).  Every completed calculation is also
+# written to <calculation target>/cache/LAST_PAD_RESULT and shown again at the
+# next start.
+PAD_RESULT_FORMAT = "SPADExp4D PAD result"
+PAD_RESULT_VERSION = 1
+LAST_PAD_RESULT = "last_pad_result.h5"
+PAD_RESULT_FILTER = "SPADExp4D PAD result (*.h5 *.hdf5);;All files (*)"
+CALCULATION_KEYS = ("mesh_path", "mesh_bytes", "openmx_seconds", "conversion_seconds",
+                    "openmx_hdf5_seconds", "mesh_seconds", "pad_seconds", "pad_kernel_seconds",
+                    "pad_computed_slices", "result_record")
+
+
+def _is_initial_settings_file(path):
+    try:
+        return Path(path).expanduser().resolve() == Path(INITIAL_SETTINGS_FILE).resolve()
+    except OSError:
+        return False
+
+
+def _read_initial_settings_raw():
+    """Return the initialization file as a dict, or {} when absent or invalid."""
+    try:
+        values = json.loads(Path(INITIAL_SETTINGS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return values if isinstance(values, dict) else {}
+
+
+def configured_data_folder():
+    """Return the data folder stored in the initialization file.
+
+    A relative path is taken relative to the project folder.  Without a stored
+    value the bundled ``structures`` folder is used.
+    """
+    value = _read_initial_settings_raw().get(DATA_FOLDER_KEY)
+    if not isinstance(value, str) or not value.strip():
+        return DEFAULT_DATA_FOLDER
+    path = Path(value.strip()).expanduser()
+    return path if path.is_absolute() else PROJECT / path
+
+
+def save_data_folder(path):
+    """Store the data folder in the initialization file, keeping PAD defaults."""
+    values = _read_initial_settings_raw()
+    if any(key not in values for key in SETTING_KEYS):
+        # read_settings() requires a complete parameter set once the file exists.
+        values = {**validate_settings(DEFAULT_SETTINGS), **values}
+    values[DATA_FOLDER_KEY] = str(Path(path).expanduser().resolve())
+    core.json_write(INITIAL_SETTINGS_FILE, values)
+
+
+def read_session():
+    """Return the window state saved at the last exit ({} when absent)."""
+    state = _read_initial_settings_raw().get(SESSION_KEY)
+    return state if isinstance(state, dict) else {}
+
+
+def save_session(settings, state):
+    """Store the GUI parameters and window state for the next start."""
+    write_settings(INITIAL_SETTINGS_FILE, settings)
+    values = _read_initial_settings_raw()
+    values[SESSION_KEY] = state
+    core.json_write(INITIAL_SETTINGS_FILE, values)
+
+
+def set_data_folder(path):
+    """Point structure discovery and every OpenMX/PAD output at one folder."""
+    global STRUCTURES, DEFAULT_STRUCTURE
+    STRUCTURES = Path(path).expanduser().resolve()
+    DEFAULT_STRUCTURE = STRUCTURES / "graphite"
+    core.set_structures_root(STRUCTURES)
+    configure_runtime_paths(DEFAULT_STRUCTURE)
+    return STRUCTURES
 
 
 
@@ -141,8 +230,8 @@ def validate_settings(settings):
         raise ValueError("Gaussian widths dk and dE must be non-negative.")
     if not 0 < normalized["theta_max"] <= 90:
         raise ValueError("theta_max must be greater than 0 and at most 90 degrees.")
-    if not 0 <= normalized["alpha"] <= 360 or not 0 <= normalized["gamma"] <= 360:
-        raise ValueError("Euler angles alpha and gamma must be between 0 and 360 degrees.")
+    if not -360 <= normalized["alpha"] <= 360 or not -360 <= normalized["gamma"] <= 360:
+        raise ValueError("Euler angles alpha and gamma must be between -360 and 360 degrees.")
     if not 0 <= normalized["beta"] <= 180:
         raise ValueError("Euler angle beta must be between 0 and 180 degrees.")
     if not (-K_LIMIT <= normalized["k_min"] < normalized["k_max"] <= K_LIMIT):
@@ -160,6 +249,10 @@ def validate_settings(settings):
     normalized["pad_engine"] = settings.get("pad_engine", "cpp")
     if normalized["pad_engine"] not in ("cpp", "python"):
         raise ValueError("pad_engine must be cpp or python.")
+    # OpenMX keyword overrides on top of the target's CIF template (optional).
+    normalized["openmx"] = core.validate_openmx_overrides(settings.get("openmx"))
+    window = core.validate_band_window(settings.get("band_window"))
+    normalized["band_window"] = None if window is None else list(window)
     return normalized
 
 def read_settings(path=INITIAL_SETTINGS_FILE):
@@ -187,6 +280,9 @@ def read_settings(path=INITIAL_SETTINGS_FILE):
 
 def write_settings(path, settings):
     values = validate_settings(settings)
+    if _is_initial_settings_file(path):
+        existing = _read_initial_settings_raw()
+        values.update({key: existing[key] for key in APP_SETTING_KEYS if key in existing})
     core.json_write(path, values)
 
 def configure_runtime_paths(structure_path=None):
@@ -433,8 +529,36 @@ def field_request(field):
     return [[round(float(value.real), 15), round(float(value.imag), 15)]
             for value in field]
 
+# The SPADExp engine reads file names with sscanf("%s"), which stops at the
+# first space: a data folder such as "/Volumes/My Disk/..." truncated
+# Output_file and the run failed.  The engine therefore runs inside its
+# temporary directory and only sees these space-free relative names.
+ENGINE_POTENTIALS = "Atomic_potentials.hdf5"
+ENGINE_ORBITALS = "PAO_and_AO_after_opt.hdf5"
+ENGINE_LOG = "pad.log"
+
+
+def prepare_engine_directory(directory):
+    """Link the shared atomic data into the engine's run directory."""
+    for name, target in ((ENGINE_POTENTIALS, ATOMIC_POTENTIALS), (ENGINE_ORBITALS, ATOMIC_ORBITALS)):
+        link = Path(directory) / name
+        if not link.exists():
+            link.symlink_to(Path(target).resolve())
+
+
+def keep_engine_log(directory, destination):
+    """Copy the engine log from the run directory to the structure cache."""
+    log = Path(directory) / ENGINE_LOG
+    if log.is_file():
+        shutil.copyfile(log, destination)
+
+
 def pad_text(source, destination, logfile, hv, v0, wf, eb_min, eb_max, de,
              gaussian_de, field):
+    """PAD input with file names relative to the engine's run directory."""
+    for value in (source, destination, logfile):
+        if any(ch.isspace() for ch in str(value)):
+            raise ValueError(f"SPADExp engine file names must not contain spaces: {value}")
     ex, ey, ez = field
     return f"""&Control
 Calculation PAD
@@ -443,7 +567,7 @@ Console_log true
 Output_file {destination}
 /
 &Atomic-wfn
-Potential_file {ATOMIC_POTENTIALS}
+Potential_file {ENGINE_POTENTIALS}
 /
 &PAD
 Input_file {source}
@@ -458,7 +582,7 @@ Photon_energy {hv}
 Inner_potential {v0}
 Work_function {wf}
 Electric_field {ex.real} {ex.imag} {ey.real} {ey.imag} {ez.real} {ez.imag}
-Atomic_orbitals_file {ATOMIC_ORBITALS}
+Atomic_orbitals_file {ENGINE_ORBITALS}
 /
 &Radial-grid 3
 0.0025 40
@@ -509,13 +633,16 @@ def gaussian_smooth_axis(values, width, step, axis, mode="edge", stop=None):
 
     padding = [(0, 0)] * values.ndim; padding[axis] = (radius, radius)
     padded = np.pad(values, padding, mode=mode)
-    smoothed = np.zeros_like(values)
-    for i, weight in enumerate(kernel):
-        core.check_stop(stop)
-        section = [slice(None)] * values.ndim
-        section[axis] = slice(i, i + values.shape[axis])
-        smoothed += weight * padded[tuple(section)]
-    return smoothed
+    core.check_stop(stop)
+    # smoothed[i] = sum_j kernel[j] * padded[i + j] along the axis, done as one
+    # banded matrix product (BLAS) instead of a loop over the kernel taps.
+    count = values.shape[axis]; rows = np.arange(count)
+    band = np.zeros((count, count + 2 * radius))
+    for j, weight in enumerate(kernel):
+        band[rows, rows + j] = weight
+    smoothed = np.tensordot(band, np.moveaxis(padded, axis, 0), axes=(1, 0))
+    core.check_stop(stop)
+    return np.ascontiguousarray(np.moveaxis(smoothed, 0, axis))
 
 
 def gaussian_smooth_k_map(values, dk, extent):
@@ -604,6 +731,16 @@ def trajectory_bz_boundaries(xlim, kz_max):
 class Canvas(FigureCanvasQTAgg):
     def __init__(self): self.figure = Figure(figsize=(16,13), constrained_layout=True); super().__init__(self.figure)
 
+    def print_figure(self, *args, **kwargs):
+        # EB-dependent panels are "animated" for fast slider updates, and
+        # matplotlib leaves animated axes out of saved images.  Save them all.
+        animated = [artist for artist in self.figure.findobj() if artist.get_animated()]
+        for artist in animated: artist.set_animated(False)
+        try:
+            return super().print_figure(*args, **kwargs)
+        finally:
+            for artist in animated: artist.set_animated(True)
+
 def energies(settings):
     count = int(round((settings['eb_max'] - settings['eb_min']) / settings['de'])) + 1
     return [round(settings['eb_min'] + i * settings['de'], 8) for i in range(count)]
@@ -686,6 +823,155 @@ def save_pad_volume(request, raw_maps):
     return PAD_VOLUME.stat().st_size
 
 
+def structure_files(structure_path):
+    """Return the CIF and OpenMX template texts of a calculation target."""
+    info = {}
+    if not structure_path:
+        return info
+    cif = structure_cif_path(structure_path)
+    if cif is not None:
+        info["cif"] = cif.read_text(errors="replace"); info["cif_name"] = cif.name
+    template = Path(structure_path) / ".openmx.base.dat"
+    if template.is_file():
+        info["openmx_template"] = template.read_text(errors="replace")
+    return info
+
+
+def pad_result_complete(result):
+    """True when every EB slice of the result's settings has been calculated."""
+    if not result or "v0" not in result or "s" not in result:
+        return False
+    raw = result.get("raw_maps", {})
+    return all(eb in raw for eb in energies(result["s"]))
+
+
+def save_pad_result(path, result, structure_path=None):
+    """Write a complete PAD result and everything needed to show it to one HDF5 file.
+
+    The file holds the unbroadened PAD and band-weight volumes (EB, ky, kx),
+    every GUI/OpenMX setting, the fixed-coordinate band cut, the crystal
+    structure (CIF, OpenMX template, lattice) and calculation metadata.
+    Gaussian dK/dE are stored as settings and reapplied when the file is read.
+    """
+    if not pad_result_complete(result):
+        raise ValueError("The PAD result is incomplete. Finish the calculation before saving it.")
+    s = validate_settings(result["s"]); ebs = energies(s); raw = result["raw_maps"]
+    axis = cartesian_axis(s); count = len(axis)
+    pad = np.stack([np.asarray(raw[eb]["pad"], dtype=float) for eb in ebs])
+    weight = np.stack([np.asarray(raw[eb]["band_weight"], dtype=float) for eb in ebs])
+    error = np.asarray([float(raw[eb]["error"]) for eb in ebs])
+    structure = structure_files(structure_path) or dict(result.get("structure") or {})
+    lattice = np.asarray(result.get("lattice", core.LATTICE), dtype=float)
+    reciprocal = np.asarray(result.get("reciprocal", core.G), dtype=float)
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    volume = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=(1, count, count))
+    text = h5py.string_dtype()
+    with h5py.File(tmp, "w") as f:
+        f.attrs.update(format=PAD_RESULT_FORMAT, format_version=PAD_RESULT_VERSION,
+                       software=f"SPADExp4D {__version__}",
+                       created=datetime.now().astimezone().isoformat(timespec="seconds"),
+                       structure_name=result.get("structure_name") or "")
+        settings = f.create_group("Settings")
+        settings.attrs["json"] = json.dumps(s, sort_keys=True, ensure_ascii=False)
+        for key, value in s.items():
+            if isinstance(value, (bool, int, float, str)):
+                settings.attrs[key] = value
+        group = f.create_group("PAD")
+        group.attrs.update(layout="EB, ky, kx", v0_eV=float(result["v0"]),
+                           description="Unbroadened PAD and band weight. Gaussian dK/dE "
+                                       "(Settings) are applied when the file is shown.")
+        group.create_dataset("binding_energy", data=np.asarray(ebs)).attrs["units"] = "eV"
+        group.create_dataset("k", data=axis).attrs["units"] = "1/Angstrom (kx and ky)"
+        group.create_dataset("pad", data=pad, **volume)
+        group.create_dataset("band_weight", data=weight, **volume)
+        group.create_dataset("nearest_eigenstate_distance", data=error).attrs["units"] = "1/Angstrom"
+        if result.get("pad_request"):
+            group.attrs["request_json"] = json.dumps(result["pad_request"], sort_keys=True)
+        line = result.get("line")
+        if line:
+            cut = f.create_group("BandCut")
+            cut.attrs.update(direction=s["direction"], a=s["a"], b=s["b"],
+                             error=float(line.get("error", 0.0)), method=str(line.get("method", "")),
+                             path=str(line.get("path", "")))
+            if line.get("k") is not None and line.get("bands") is not None:
+                cut.create_dataset("k", data=np.asarray(line["k"], dtype=float)).attrs["units"] = "1/Angstrom"
+                cut.create_dataset("energy", data=np.asarray(line["bands"], dtype=float)).attrs["units"] = "eV, E - EF"
+            if line.get("points") is not None:
+                cut.create_dataset("points", data=np.asarray(line["points"], dtype=float).reshape(-1, 2)
+                                   ).attrs["units"] = "k (1/Angstrom), E - EF (eV)"
+        crystal = f.create_group("Structure")
+        crystal.create_dataset("lattice", data=lattice).attrs["units"] = "Angstrom (rows a1, a2, a3)"
+        crystal.create_dataset("reciprocal", data=reciprocal).attrs["units"] = "1/Angstrom (rows G1, G2, G3)"
+        for key in ("cif", "openmx_template"):
+            if structure.get(key):
+                crystal.create_dataset(key, data=structure[key], dtype=text)
+        if structure.get("cif_name"):
+            crystal.attrs["cif_name"] = structure["cif_name"]
+        calculation = f.create_group("Calculation")
+        calculation.attrs["sampling_error"] = float(result.get("sampling_error", error.max(initial=0)))
+        for key in CALCULATION_KEYS:
+            value = result.get(key)
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                calculation.attrs[key] = value
+            elif value is not None:
+                calculation.attrs[key] = str(value)
+    tmp.replace(path)
+    return path
+
+
+def load_pad_result(path):
+    """Read a file written by save_pad_result() as an undisplayed result."""
+    path = Path(path)
+    try:
+        with h5py.File(path, "r") as f:
+            if f.attrs.get("format") != PAD_RESULT_FORMAT:
+                raise ValueError(f"Not a SPADExp4D PAD result file: {path}")
+            version = int(f.attrs.get("format_version", 0))
+            if version > PAD_RESULT_VERSION:
+                raise ValueError(f"This file was written by a newer SPADExp4D (format {version}).")
+            s = validate_settings(json.loads(f["Settings"].attrs["json"]))
+            group = f["PAD"]; ebs = energies(s); count = len(cartesian_axis(s))
+            stored = group["binding_energy"][()]
+            pad = group["pad"][()]; weight = group["band_weight"][()]
+            error = group["nearest_eigenstate_distance"][()]
+            shape = (len(ebs), count, count)
+            if (len(stored) != len(ebs) or not np.allclose(stored, ebs, rtol=0, atol=1e-6)
+                    or pad.shape != shape or weight.shape != shape or error.shape != (len(ebs),)):
+                raise ValueError(f"The PAD arrays do not match the stored settings: {path}")
+            extent = (s["k_min"], s["k_max"]) * 2
+            raw = {eb: {"eb": eb, "pad": pad[i], "band_weight": weight[i],
+                        "error": float(error[i]), "extent": extent} for i, eb in enumerate(ebs)}
+            result = dict(s=s, raw_maps=raw, maps={}, cuts={}, v0=float(group.attrs["v0_eV"]),
+                          structure_name=str(f.attrs.get("structure_name", "")) or None,
+                          created=str(f.attrs.get("created", "")), source_file=str(path))
+            if "request_json" in group.attrs:
+                result["pad_request"] = json.loads(group.attrs["request_json"])
+            if "BandCut" in f:
+                cut = f["BandCut"]
+                result["line"] = {"k": cut["k"][()] if "k" in cut else None,
+                                  "bands": cut["energy"][()] if "energy" in cut else None,
+                                  "points": cut["points"][()] if "points" in cut else np.zeros((0, 2)),
+                                  "error": float(cut.attrs.get("error", 0.0)),
+                                  "method": str(cut.attrs.get("method", "")),
+                                  "path": str(cut.attrs.get("path", ""))}
+            crystal = f["Structure"]
+            result["lattice"] = crystal["lattice"][()]; result["reciprocal"] = crystal["reciprocal"][()]
+            structure = {key: crystal[key].asstr()[()] for key in ("cif", "openmx_template") if key in crystal}
+            if "cif_name" in crystal.attrs:
+                structure["cif_name"] = str(crystal.attrs["cif_name"])
+            result["structure"] = structure
+            calculation = f["Calculation"].attrs
+            for key in CALCULATION_KEYS:
+                if key in calculation:
+                    value = calculation[key]
+                    result[key] = value.item() if isinstance(value, np.generic) else value
+            result["sampling_error"] = float(calculation.get("sampling_error", error.max(initial=0)))
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read the PAD result file {path}: {exc}") from exc
+    return result
+
+
 def prune_old_pad_artifacts():
     """Remove legacy slice caches and diagnostics from older PAD requests."""
     removed = 0; removed_bytes = 0
@@ -727,7 +1013,7 @@ def write_batch_input(path, grid, s, v0, requested):
             Xvector=frac((1, 0, 0), reciprocal), Yvector=frac((0, 1, 0), reciprocal),
             Xcount=count, Ycount=count, Count=count*count,
             Xrange=[s['k_min'], s['k_max']], Yrange=[s['k_min'], s['k_max']],
-            minN=core.BANDS[0], maxN=core.BANDS[1])
+            minN=getattr(grid, 'band_range', core.BANDS)[0], maxN=getattr(grid, 'band_range', core.BANDS)[1])
         k.create_dataset('Coordinates', data=frac(cart, reciprocal))
         group = out.create_group('Batch')
         group.attrs.update(KMin=s['k_min'], KMax=s['k_max'], H2M=H2M, BandHartree_eV=EH, RawSpectrum=1, EnergyStep_eV=s['de'])
@@ -749,7 +1035,8 @@ def pad_batch(grid, s, v0, requested, field, receive, log=None, stop=None, binar
             todo = [item[0] for item in jobs]
             write_batch_input(source, grid, s, v0, todo)
             code = core.request_code([item[1] for item in jobs])
-            inp.write_text(pad_text(source, output, OUTPUT / f'batch_{code}_PAD.log',
+            prepare_engine_directory(directory)
+            inp.write_text(pad_text(source.name, output.name, ENGINE_LOG,
                 s['hv'], v0, s['wfnc'], min(todo), max(todo), s['de'], s['de']/10, field))
             consumed = 0
             def collect():
@@ -779,6 +1066,7 @@ def pad_batch(grid, s, v0, requested, field, receive, log=None, stop=None, binar
                 elapsed = core.run_command([binary], OUTPUT / f'batch_{code}_stdout.log',
                     directory, stdin=inp, expected=output, on_output=on_output, stop=stop)
             finally:
+                keep_engine_log(directory, OUTPUT / f'batch_{code}_PAD.log')
                 collect()
             with h5py.File(output, 'r') as f:
                 if not f.attrs.get('Complete') or consumed != len(todo):
@@ -811,18 +1099,23 @@ def pad_slice(grid, settings, v0, eb, field, log=None, stop=None):
         directory = Path(temporary); source = directory / 'states.hdf5'; output = directory / 'pad.hdf5'
         error = grid.write_path(source, cart, attrs)
         inp = directory / 'pad.in'
-        inp.write_text(pad_text(source, output, OUTPUT / f'slice_{code}_PAD.log',
+        prepare_engine_directory(directory)
+        inp.write_text(pad_text(source.name, output.name, ENGINE_LOG,
                                s['hv'], v0, s['wfnc'], engine_eb, engine_eb, s['de'], sigma, field))
         with h5py.File(source, 'r') as f:
-            bands = (f['Output/Band'][:] - grid.ef) * PAD_EH
+            bands = np.concatenate([f[path][:] for path in core.band_paths(core.spin_of(f))], axis=1)
+            bands = (bands - grid.ef) * PAD_EH
         # Raw densities: each eigenstate occupies one half-open EB bin.
         active = np.floor((bands + eb) / s['de'] + 0.5) == 0
         if not active.any():
             pad = np.zeros((count, count))
             if log: log(f'[PAD skipped] EB={eb:g}: intensity set to 0 because the EB bin contains no states')
         else:
-            core.run_command([SPADEXP], OUTPUT / f'slice_{code}_stdout.log', directory,
-                             stdin=inp, expected=output, on_output=log, stop=stop)
+            try:
+                core.run_command([SPADEXP], OUTPUT / f'slice_{code}_stdout.log', directory,
+                                 stdin=inp, expected=output, on_output=log, stop=stop)
+            finally:
+                keep_engine_log(directory, OUTPUT / f'slice_{code}_PAD.log')
             if not pad_ok(output, s['hv'], v0, s['wfnc'], 2, engine_eb, engine_eb, s['de'], sigma, field):
                 raise RuntimeError('PAD output energy or calculation conditions do not match.')
             with h5py.File(output, 'r') as f:
@@ -864,13 +1157,74 @@ def cut_slice(data, s, v0):
     return result
 
 
-def fixed_band(grid, s):
-    axis = cartesian_axis(s); coord = {'kx': 0, 'ky': 1, 'kz': 2}[s['direction']]
-    cart = np.zeros((len(axis), 3)); cart[:, coord] = axis
-    cart[:, [i for i in range(3) if i != coord]] = (s['a'], s['b'])
-    bands, error = grid.interpolated_bands(cart)
-    return {'k': axis, 'bands': bands, 'error': float(error.max(initial=0)),
-            'method': 'periodic trilinear scalar interpolation'}
+def slice_path(s):
+    """In-plane (kx, ky) of the PAD slice; kz follows the photoemission sphere."""
+    axis = cartesian_axis(s)
+    if s['direction'] == 'kx': return np.asarray(axis), np.full_like(axis, s['a'])
+    if s['direction'] == 'ky': return np.full_like(axis, s['a']), np.asarray(axis)
+    return np.array([s['a']], dtype=float), np.array([s['b']], dtype=float)
+
+
+def pad_cut_bands(grid, s, v0, rows_per_chunk=None):
+    """Bands along the PAD slice, i.e. on the photoemission sphere.
+
+    At binding energy EB the PAD slice samples k = (kx, ky, kz) with
+    kz = sqrt((hν + V0 − EB)/H2M − kx² − ky²), so kz changes with EB.  Band n
+    appears in the slice where EB = −E_n(k(EB)) (E relative to EF).  The sign
+    changes of EB + E_n between neighbouring EB rows locate these points, which
+    are refined linearly.  Eigenvalues are trilinearly interpolated on the mesh.
+
+    Returns 'k' and 'bands' (E − EF, one column per band, NaN where the band
+    is outside the slice) for lines, and 'points' (k, E − EF) where a band
+    meets one k column more than once.  For a kz slice every point is in
+    'points' with k = kz.
+    """
+    ebs = np.asarray(energies(s), dtype=float); x, y = slice_path(s)
+    kp2 = x * x + y * y; columns = len(x)
+    # About 4096 k points per interpolation call keeps memory to tens of MB.
+    rows_per_chunk = rows_per_chunk or max(1, 4096 // columns)
+    previous = previous_eb = None; error = 0.0; band_count = 0
+    found_columns, found_bands, found_roots = [], [], []
+    for start in range(0, len(ebs), rows_per_chunk):
+        block = ebs[start:start + rows_per_chunk]
+        z2 = (s['hv'] + v0 - block[:, None]) / H2M - kp2[None, :]
+        rows, cols = np.nonzero(z2 >= 0)
+        g = None
+        if len(rows):
+            cart = np.stack((x[cols], y[cols], np.sqrt(z2[rows, cols])), axis=1)
+            energy, distance = grid.interpolated_bands(cart)
+            energy = np.asarray(energy, dtype=float); band_count = energy.shape[1]
+            error = max(error, float(np.max(distance, initial=0.0)))
+            g = np.full((len(block), columns, band_count), np.nan)
+            g[rows, cols] = block[rows, None] + energy  # EB + E_n: zero on the band
+        for i, eb in enumerate(block):
+            current = None if g is None else g[i]
+            if previous is not None and current is not None:
+                crossing = ((previous < 0) & (current >= 0)) | ((previous >= 0) & (current < 0))
+                col, band = np.nonzero(crossing)
+                p, c = previous[col, band], current[col, band]
+                found_columns.append(col); found_bands.append(band)
+                found_roots.append(previous_eb + (eb - previous_eb) * p / (p - c))
+            previous, previous_eb = current, eb
+    col = np.concatenate(found_columns) if found_columns else np.zeros(0, dtype=int)
+    band = np.concatenate(found_bands) if found_bands else np.zeros(0, dtype=int)
+    root = np.concatenate(found_roots) if found_roots else np.zeros(0)
+    counts = np.zeros((columns, band_count), dtype=int)
+    np.add.at(counts, (col, band), 1)
+    single = counts[col, band] == 1 if s['direction'] != 'kz' else np.zeros(len(col), dtype=bool)
+    lines = np.full((columns, band_count), np.nan)
+    lines[col[single], band[single]] = -root[single]
+    lines = lines[:, np.isfinite(lines).any(axis=0)]
+    rest = ~single
+    if s['direction'] == 'kz':
+        k_points = np.sqrt(np.maximum((s['hv'] + v0 - root[rest]) / H2M - kp2[col[rest]], 0.0))
+    else:
+        k_points = cartesian_axis(s)[col[rest]]
+    return {'k': cartesian_axis(s) if s['direction'] != 'kz' else None,
+            'bands': lines if s['direction'] != 'kz' else None,
+            'points': np.column_stack((k_points, -root[rest])),
+            'error': error, 'path': 'photoemission sphere along the PAD slice',
+            'method': 'EB = -E_n(k(EB)) crossings; periodic trilinear interpolation of eigenvalues'}
 
 
 def prepare_display(result, settings, stop=None):
@@ -911,10 +1265,13 @@ class Worker(QtCore.QObject):
     partial = QtCore.pyqtSignal(object); log = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int); status = QtCore.pyqtSignal(str)
 
-    def __init__(self, settings, structure_path=None):
+    def __init__(self, settings, structure_path=None, save_last=False):
         super().__init__(); self.s = settings; self.structure_path = Path(structure_path) if structure_path else None
         self.structure_name = self.structure_path.name if self.structure_path else "graphite"
         self.stop_event = threading.Event()
+        # Write the finished result to <target>/cache/LAST_PAD_RESULT so the
+        # next start can show it (the application window enables this).
+        self.save_last = save_last
 
     def request_stop(self):
         self.stop_event.set()
@@ -933,8 +1290,12 @@ class Worker(QtCore.QObject):
         try:
             configure_runtime_paths(self.structure_path)
             core.configure_structure(self.structure_path)
-            self.log.emit(f'[OpenMX all bands] {core.BANDS[1] - core.BANDS[0] + 1} bands '
-                          f'(indices {core.BANDS[0]}–{core.BANDS[1]}, including states above EF)')
+            overrides = core.openmx_overrides(self.s); full = core.request_band_range(overrides)
+            spin = core.effective_openmx(overrides)['scf.SpinPolarization']; window = core.band_window(self.s)
+            self.log.emit(f'[OpenMX bands] scf.SpinPolarization {spin}: {full[1] - full[0] + 1} bands'
+                          + (' per spin' if spin == 'on' else '')
+                          + ('; all stored' if window is None
+                             else f'; stored E−EF {window[0]:g} to {window[1]:g} eV'))
             mkdirs(); core.check_stop(self.stop_event.is_set)
             v0 = (automatic_v0(SCF_H5, self.s['v0'])
                   if self.structure_path is None else (self.s['v0'] if self.s['v0'] > 0 else 20.0))
@@ -965,7 +1326,7 @@ class Worker(QtCore.QObject):
             core.check_stop(self.stop_event.is_set)
             grid = core.EigenstateGrid(path)
             self.log.emit(f'[HDF5] {path}; LCAO=float32 + gzip; all first-BZ points complete')
-            result['line'] = fixed_band(grid, self.s)
+            result['line'] = pad_cut_bands(grid, self.s, v0)
             result['sampling_error'] = result['line']['error']
             self.snapshot(result)
             requested = energies(self.s); components = polarization_components(self.s)
@@ -991,6 +1352,7 @@ class Worker(QtCore.QObject):
                                   f'{format_file_size(removed_bytes)} deleted')
                 volume_request = pad_volume_request(grid, self.s, v0, requested,
                                                     components, pad_binary)
+                result['pad_request'] = volume_request
                 cached = load_pad_volume(volume_request, self.s)
                 if cached is not None:
                     self.log.emit(f'[PAD volume reused] {PAD_VOLUME}; '
@@ -1037,6 +1399,14 @@ class Worker(QtCore.QObject):
                 result['pad_seconds'] = time.monotonic() - pad_started
             self.stage(99, 'Applying Gaussian dK/dE to the saved PAD')
             result = prepare_display(result, self.s, self.stop_event.is_set)
+            if self.save_last and self.structure_path is not None:
+                self.stage(99, 'Saving the PAD result for the next start')
+                try:
+                    saved = save_pad_result(self.structure_path / 'cache' / LAST_PAD_RESULT,
+                                            result, self.structure_path)
+                    self.log.emit(f'[PAD result saved] {saved}; {format_file_size(saved.stat().st_size)}')
+                except Exception as exc:  # a failed save must not fail the calculation
+                    self.log.emit(f'[PAD result not saved] {exc}')
             self.stage(100, 'Complete'); self.done.emit(result)
         except core.Cancelled:
             self.stopped.emit(prepare_display(result, self.s))
@@ -1046,15 +1416,31 @@ class Worker(QtCore.QObject):
             if grid is not None: grid.close()
 
 
+class DisplayRelay(QtCore.QObject):
+    """Delivers a result smoothed in a background thread to the GUI thread."""
+    ready = QtCore.pyqtSignal(int, object, object)  # job, display result, error text
+
+
 class Window(QtWidgets.QMainWindow):
-    def __init__(self, initial_settings):
+    def __init__(self, initial_settings, session=False):
         super().__init__(); self.setWindowTitle("SPADExp4D — first-BZ eigenstate cache"); self.resize(1500,1050)
         self.initial_settings = validate_settings(initial_settings)
+        self.startup_settings = self.initial_settings
+        # session=True (the application, not tests): restore the last window
+        # state and PAD result, save them again on exit, and keep every
+        # finished result in <target>/cache/LAST_PAD_RESULT.
+        self.persist_session = session
+        self._session = read_session() if session else {}
+        self._preferred_structure = self._session.get("structure")
         self.result = self.thread = self.worker = None; self._closing = False
+        self._display_job = 0; self._pending_display = None
+        self._display_relay = DisplayRelay(self); self._display_relay.ready.connect(self.background_display_ready)
         self.eb_sweep_timer = QtCore.QTimer(self)
         self.eb_sweep_timer.setInterval(250)
         self.eb_sweep_timer.timeout.connect(self.advance_eb_sweep)
         self.current_structure = None; self.build(); self.direction_changed()
+        if session:
+            self.restore_session()
     def spin(self, value, lo=-100, hi=100):
         x=QtWidgets.QDoubleSpinBox(); x.setRange(lo,hi); x.setDecimals(3); x.setValue(value); x.setSingleStep(.1); return x
     def build(self):
@@ -1070,10 +1456,22 @@ class Window(QtWidgets.QMainWindow):
         side.addWidget(title)
         g=QtWidgets.QGridLayout(); g.setContentsMargins(0,0,0,0); g.setHorizontalSpacing(4); g.setVerticalSpacing(1)
         row=0
+        def row_label(label):
+            # A label may also be a widget such as a button (incident angles).
+            lab=(label if isinstance(label,QtWidgets.QWidget) else QtWidgets.QLabel(label))
+            if isinstance(lab,QtWidgets.QLabel): lab.setStyleSheet("margin: 0; padding: 0;")
+            return lab
         def add_row(label, widget):
             nonlocal row
-            lab=(label if isinstance(label,QtWidgets.QLabel) else QtWidgets.QLabel(label)); lab.setStyleSheet("margin: 0; padding: 0;")
-            g.addWidget(lab,row,0); g.addWidget(widget,row,1); row+=1
+            g.addWidget(row_label(label),row,0); g.addWidget(widget,row,1); row+=1
+        def form_page(rows):
+            """A tab page laid out like the sidebar: one label and value per row."""
+            page=QtWidgets.QWidget(); grid=QtWidgets.QGridLayout(page)
+            grid.setContentsMargins(6,6,6,6); grid.setHorizontalSpacing(4); grid.setVerticalSpacing(1)
+            for line,(label,widget) in enumerate(rows):
+                grid.addWidget(row_label(label),line,0); grid.addWidget(widget,line,1)
+            grid.setColumnStretch(1,1); grid.setRowStretch(len(rows),1)
+            return page
         def add_full_row(widget):
             nonlocal row
             g.addWidget(widget,row,0,1,2); row+=1
@@ -1082,26 +1480,44 @@ class Window(QtWidgets.QMainWindow):
             layout.setContentsMargins(0,0,0,0); layout.setSpacing(3)
             for widget in widgets: layout.addWidget(widget,1)
             return holder
+        # Only the tail of the path is shown, so a long data folder path never
+        # widens the sidebar; the full path is in the tooltip.
+        self.data_folder_button = QtWidgets.QPushButton()
+        self.data_folder_button.setStyleSheet("text-align: left; padding: 2px 6px;")
+        self.data_folder_button.clicked.connect(self.show_preferences)
+        add_row("Data folder", self.data_folder_button)
+        self.update_data_folder_button()
         self.structure_combo = QtWidgets.QComboBox()
-        self.structure_combo.setToolTip("Calculation targets under structures/<structure_name>")
+        self.structure_combo.setToolTip("Calculation targets under <data folder>/<structure_name> (Settings > Preferences…)")
         self.structure_combo.currentIndexChanged.connect(self.structure_changed)
         add_row("Calculation target", self.structure_combo)
         self.result_combo = QtWidgets.QComboBox()
         self.result_combo.setToolTip("Saved calculation results for the selected structure")
         self.result_combo.currentIndexChanged.connect(self.result_selection_changed)
         add_row("Calculation result", self.result_combo)
+        # OpenMX settings are grouped in tabs: the first-BZ k division, and the
+        # OpenMX input keywords (filled in as they become editable).
+        self.openmx_tabs=QtWidgets.QTabWidget()
+        division=QtWidgets.QWidget(); kg=QtWidgets.QGridLayout(division)
+        kg.setContentsMargins(6,6,6,6); kg.setHorizontalSpacing(12); kg.setVerticalSpacing(1)
         self.nboxes=[]; self.glabels=[]
         for i in range(3):
             box=QtWidgets.QSpinBox(); box.setRange(1,256); box.setValue(initial[f"N{i+1}"])
             box.setToolTip("First-BZ divisions. Changing these selects or calculates the corresponding eigenstate cache.")
             self.nboxes.append(box)
             box.valueChanged.connect(self.update_mesh_labels)
-        add_row("N1, N2, N3",inline(*self.nboxes))
+        kg.addWidget(QtWidgets.QLabel("N1, N2, N3"),0,0); kg.addWidget(inline(*self.nboxes),0,1)
         for i in range(3):
             label=QtWidgets.QLabel(); label.setWordWrap(False); self.glabels.append(label)
-            add_full_row(label)
+            kg.addWidget(label,1+i,0,1,2)
         self.total_points=QtWidgets.QLabel(); self.total_points.setWordWrap(True)
-        add_row("Total k-point count",self.total_points)
+        kg.addWidget(QtWidgets.QLabel("Total k-point count"),4,0); kg.addWidget(self.total_points,4,1)
+        kg.setColumnStretch(1,1)
+        self.openmx_tabs.addTab(division,"OpenMX K division")
+        self.openmx_tabs.addTab(self.build_openmx_parameters(inline),"OpenMX Parameters")
+        self.openmx_tabs.setTabToolTip(1,OPENMX_PARAMETERS_HELP)
+        self.load_openmx_parameters(initial["openmx"]); self.set_band_window(initial["band_window"])
+        add_full_row(self.openmx_tabs)
         self.mesh_result=QtWidgets.QLabel("Not available"); self.mesh_result.setWordWrap(True)
         self.mesh_result.setTextInteractionFlags(
             QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1110,38 +1526,55 @@ class Window(QtWidgets.QMainWindow):
         self.pad_engine=QtWidgets.QComboBox()
         self.pad_engine.addItem("C++ batch", "cpp"); self.pad_engine.addItem("Python per EB (comparison)", "python")
         self.pad_engine.setCurrentIndex(self.pad_engine.findData(initial["pad_engine"]))
-        add_row("PAD calculation",self.pad_engine)
         self.hv=self.spin(initial["hv"],.01,10000); self.v0=self.spin(initial["v0"],-1000,1000)
         self.ef_shift=self.spin(initial["ef_shift"],-1000,1000); self.wfnc=self.spin(initial["wfnc"],0,100)
-        for label,box in (("hν (eV)",self.hv),("V0 (eV; ≤0:auto)",self.v0),
-                          ("EF shift (eV)",self.ef_shift),("wfnc (eV)",self.wfnc)): add_row(label,box)
         self.ef_shift.setToolTip(
             "Display-only shift added to the calculated binding energy. "
             "Moves the band plot and energy slice within the fixed display range.")
         self.eb_min=self.spin(initial["eb_min"],-1000,1000); self.eb_max=self.spin(initial["eb_max"],-1000,1000); self.de=self.spin(initial["de"],.001,100)
         self.eb_min.setToolTip("Negative EB includes eigenstates above the original EF in the PAD calculation.")
-        add_row("EB Begin, End, Step (eV)",inline(self.eb_min,self.eb_max,self.de))
         self.direction=QtWidgets.QComboBox(); self.direction.addItems(("kx","ky","kz")); self.direction.setCurrentText(initial["direction"]); self.direction.currentTextChanged.connect(self.direction_changed)
         self.la,self.lb=QtWidgets.QLabel(),QtWidgets.QLabel(); self.a,self.b=self.spin(initial["a"],-20,20),self.spin(initial["b"],-20,20)
-        add_row("Slice direction",self.direction); add_row(self.la,self.a); add_row(self.lb,self.b)
         self.polarization=QtWidgets.QComboBox(); self.polarization.addItems(POLARIZATIONS); self.polarization.setCurrentText(initial["polarization"])
         self.polarization.setToolTip("unpolarized adds the c+ and c- PAD intensities")
-        self.alpha=self.spin(initial["alpha"],0,360); self.beta=self.spin(initial["beta"],0,180); self.gamma=self.spin(initial["gamma"],0,360)
-        add_row("Polarization",self.polarization); add_row("Euler a, b, c (°)",inline(self.alpha,self.beta,self.gamma))
+        self.alpha=self.spin(initial["alpha"],-360,360); self.beta=self.spin(initial["beta"],0,180); self.gamma=self.spin(initial["gamma"],-360,360)
+        self.euler_button=QtWidgets.QPushButton("Incident Angles (zyz Euler, °)…")
+        self.euler_button.setToolTip("Euler angles a, b, c (z-y-z) of the incident light. "
+                                     "Press to choose a beamline preset; the values stay editable.")
+        self.euler_button.clicked.connect(self.choose_euler_preset)
+        self.euler_button.setMinimumWidth(self.euler_button.sizeHint().width())  # never clip the text
         self.dk=self.spin(initial["dk"],0,100); self.dE=self.spin(initial["dE"],0,100)
         # Gaussian widths affect the displayed PAD, but changing a spin box
         # must not launch repeated processing while the user is typing.  The
         # values are applied by Calc (or the explicit View menu action).
         for box in (self.dk,self.dE):
             box.setToolTip("Gaussian standard deviation applied to saved PAD. 0 disables smoothing; values outside the calculation range are treated as 0.")
-        add_row("Gaussian dK (Å⁻¹)",self.dk); add_row("Gaussian dE (eV)",self.dE)
         self.theta_max=self.spin(initial["theta_max"],.001,90)
-        add_row("Maximum angle θmax (°)",self.theta_max)
         self.show_bz=QtWidgets.QCheckBox("Show Brillouin zone"); self.show_bz.setChecked(initial["show_bz"]); self.show_bz.toggled.connect(self.redraw)
-        add_row("Boundary",self.show_bz)
         self.k_min=self.spin(initial["k_min"],-K_LIMIT,K_LIMIT); self.k_max=self.spin(initial["k_max"],-K_LIMIT,K_LIMIT)
         self.k_step=self.spin(initial["k_step"],.001,2*K_LIMIT)
-        add_row("KMin, KMax, Kstep (Å⁻¹)",inline(self.k_min,self.k_max,self.k_step))
+        # PAD conditions (with the PAD engine) and the band-diagram slice are
+        # grouped in tabs.
+        self.parameter_tabs=QtWidgets.QTabWidget()
+        self.parameter_tabs.addTab(form_page((
+            ("PAD calculation",self.pad_engine),
+            ("hν (eV)",self.hv),
+            ("Polarization",self.polarization),
+            (self.euler_button,inline(self.alpha,self.beta,self.gamma)),
+            ("EF shift (eV)",self.ef_shift),
+            ("V0 (eV; ≤0:auto)",self.v0),
+            ("wfnc (eV)",self.wfnc),
+            ("Slice direction",self.direction),
+            ("KMin, KMax, Kstep (Å⁻¹)",inline(self.k_min,self.k_max,self.k_step)),
+            ("EB Begin, End, Step (eV)",inline(self.eb_min,self.eb_max,self.de)),
+            ("Gaussian dK (Å⁻¹)",self.dk),
+            ("Gaussian dE (eV)",self.dE),
+            ("Maximum angle θmax (°)",self.theta_max),
+            ("Boundary",self.show_bz))),"PAD")
+        self.parameter_tabs.addTab(form_page((
+            (self.la,self.a),
+            (self.lb,self.b))),"Band Diagram")
+        add_full_row(self.parameter_tabs)
         parameters=QtWidgets.QWidget(); parameters.setLayout(g)
         scroll=QtWidgets.QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(parameters)
         scroll.setHorizontalScrollBarPolicy(
@@ -1179,13 +1612,191 @@ class Window(QtWidgets.QMainWindow):
         outer.addWidget(sidebar)
         graphics=QtWidgets.QWidget(); graph=QtWidgets.QVBoxLayout(graphics); graph.setContentsMargins(0,0,0,0); graph.setSpacing(1)
         self.canvas=Canvas(); graph.addWidget(NavigationToolbar2QT(self.canvas,self)); graph.addWidget(self.canvas,1)
+        # Fast EB display: after each full draw keep the static background and
+        # redraw only the EB-dependent artists (see update_eb_view).
+        self._eb_artists=None; self._eb_background=None
+        self.canvas.mpl_connect('draw_event',self.on_canvas_draw)
+        self._eb_view_timer=QtCore.QTimer(self); self._eb_view_timer.setSingleShot(True)
+        self._eb_view_timer.setInterval(0); self._eb_view_timer.timeout.connect(self.update_eb_view)
         outer.addWidget(graphics,1)
         self.refresh_structures()
+    OPENMX_LABELS = {
+        "scf.XcType": ("scf.XcType", "Exchange-correlation functional"),
+        "scf.SpinPolarization": ("scf.SpinPolarization",
+                                 "off: no spin; on: collinear up/down spins; "
+                                 "NC: non-collinear spinors (needed for spin-orbit coupling)"),
+        "scf.SpinOrbit.Coupling": ("SOC", "scf.SpinOrbit.Coupling: spin-orbit coupling (requires NC)"),
+        "scf.energycutoff": ("scf.energycutoff (Ry)", "Real-space grid cutoff energy"),
+        "scf.Kgrid": ("scf.Kgrid", "k-point grid of the SCF calculation (not the first-BZ mesh)"),
+        "scf.ElectronicTemperature": ("scf.ElectronicTemperature (K)", "Electronic temperature for occupations"),
+        "scf.criterion": ("scf.criterion (Hartree)", "SCF convergence criterion, e.g. 1e-7"),
+        "scf.maxIter": ("scf.maxIter", "Maximum number of SCF iterations"),
+    }
+
+    def build_openmx_parameters(self, inline):
+        """OpenMX keywords of the selected target, edited on top of its CIF template."""
+        tab=QtWidgets.QWidget()
+        form=self.openmx_parameter_form=QtWidgets.QFormLayout(tab)
+        form.setContentsMargins(6,6,6,6); form.setVerticalSpacing(1)
+        self.openmx_xc=QtWidgets.QComboBox(); self.openmx_xc.addItems(core.XC_TYPES)
+        self.openmx_spin=QtWidgets.QComboBox(); self.openmx_spin.addItems(core.SPIN_MODES)
+        self.openmx_soc=QtWidgets.QCheckBox("scf.SpinOrbit.Coupling")
+        spin=QtWidgets.QWidget(); spin_row=QtWidgets.QHBoxLayout(spin)
+        spin_row.setContentsMargins(0,0,0,0); spin_row.setSpacing(8)
+        spin_row.addWidget(self.openmx_spin,1); spin_row.addWidget(self.openmx_soc)
+        self.openmx_cutoff=QtWidgets.QDoubleSpinBox(); self.openmx_cutoff.setRange(10,10000)
+        self.openmx_cutoff.setDecimals(1); self.openmx_cutoff.setSingleStep(10)
+        self.openmx_kgrid=[QtWidgets.QSpinBox() for _ in range(3)]
+        for box in self.openmx_kgrid: box.setRange(1,1000)
+        self.openmx_temperature=QtWidgets.QDoubleSpinBox(); self.openmx_temperature.setRange(.1,100000)
+        self.openmx_temperature.setDecimals(1); self.openmx_temperature.setSingleStep(100)
+        self.openmx_criterion=QtWidgets.QLineEdit()
+        self.openmx_criterion.setValidator(QtGui.QDoubleValidator(0.0,1.0e6,20))
+        self.openmx_maxiter=QtWidgets.QSpinBox(); self.openmx_maxiter.setRange(1,100000)
+        self.openmx_reset=QtWidgets.QPushButton("Reset to recommended")
+        self.openmx_reset.setToolTip(OPENMX_RECOMMENDED_HELP)
+        self.openmx_reset.clicked.connect(lambda: self.set_openmx_values(self.openmx_recommended))
+        last=QtWidgets.QWidget(); last_row=QtWidgets.QHBoxLayout(last)
+        last_row.setContentsMargins(0,0,0,0); last_row.setSpacing(6)
+        last_row.addWidget(self.openmx_maxiter,1); last_row.addWidget(self.openmx_reset)
+        editors={"scf.XcType":self.openmx_xc,"scf.SpinPolarization":spin,"scf.energycutoff":self.openmx_cutoff,
+                 "scf.Kgrid":inline(*self.openmx_kgrid),"scf.ElectronicTemperature":self.openmx_temperature,
+                 "scf.criterion":self.openmx_criterion,"scf.maxIter":last}
+        self.openmx_labels={}; self.openmx_base={}; self.openmx_recommended={}
+        for key in core.OPENMX_KEYWORDS:
+            text,tip=self.OPENMX_LABELS[key]
+            if key=="scf.SpinOrbit.Coupling":  # shares the spin row; its checkbox is the label
+                self.openmx_labels[key]=self.openmx_soc; self.openmx_soc.setToolTip(tip); continue
+            label=QtWidgets.QLabel(text); self.openmx_labels[key]=label
+            label.setToolTip(tip); editors[key].setToolTip(tip)
+            form.addRow(label,editors[key])
+        # Stored band window (not an OpenMX keyword): limits the k-space HDF5.
+        self.band_window_all=QtWidgets.QCheckBox("All")
+        self.band_window_low=QtWidgets.QDoubleSpinBox(); self.band_window_high=QtWidgets.QDoubleSpinBox()
+        for box,value in ((self.band_window_low,-25.0),(self.band_window_high,5.0)):
+            box.setRange(-500,500); box.setDecimals(1); box.setSingleStep(1); box.setValue(value)
+        window=QtWidgets.QWidget(); window_row=QtWidgets.QHBoxLayout(window)
+        window_row.setContentsMargins(0,0,0,0); window_row.setSpacing(4)
+        window_row.addWidget(self.band_window_all); window_row.addWidget(self.band_window_low,1)
+        window_row.addWidget(QtWidgets.QLabel("to")); window_row.addWidget(self.band_window_high,1)
+        window_label=QtWidgets.QLabel("Stored bands E−EF (eV)")
+        for widget in (window_label,window): widget.setToolTip(BAND_WINDOW_HELP)
+        form.addRow(window_label,window)
+        self.band_window_all.toggled.connect(self.update_band_window_widgets)
+        self.update_band_window_widgets()
+        self.openmx_xc.currentTextChanged.connect(self.update_openmx_markers)
+        self.openmx_spin.currentTextChanged.connect(self.spin_mode_changed)
+        self.openmx_soc.toggled.connect(self.update_openmx_markers)
+        for box in (self.openmx_cutoff,self.openmx_temperature,self.openmx_maxiter,*self.openmx_kgrid):
+            box.valueChanged.connect(self.update_openmx_markers)
+        self.openmx_criterion.textChanged.connect(self.update_openmx_markers)
+        return tab
+
+    @staticmethod
+    def canonical_openmx(key, value):
+        try:
+            return core.normalize_openmx_value(key, value)
+        except ValueError:
+            return " ".join(str(value).split())
+
+    def spin_mode_changed(self, *_):
+        if self.openmx_spin.currentText()!="NC":
+            self.openmx_soc.setChecked(False)  # OpenMX spin-orbit coupling needs NC
+        self.openmx_soc.setEnabled(self.openmx_spin.currentText()=="NC")
+        self.update_openmx_markers()
+
+    def update_band_window_widgets(self, *_):
+        for box in (self.band_window_low,self.band_window_high):
+            box.setEnabled(not self.band_window_all.isChecked())
+
+    def band_window_setting(self):
+        if self.band_window_all.isChecked():
+            return None
+        return [self.band_window_low.value(),self.band_window_high.value()]
+
+    def set_band_window(self, window):
+        self.band_window_all.setChecked(window is None)
+        if window is not None:
+            self.band_window_low.setValue(float(window[0])); self.band_window_high.setValue(float(window[1]))
+        self.update_band_window_widgets()
+
+    def openmx_widget_values(self):
+        return {"scf.XcType":self.openmx_xc.currentText(),
+                "scf.SpinPolarization":self.openmx_spin.currentText(),
+                "scf.SpinOrbit.Coupling":"on" if self.openmx_soc.isChecked() else "off",
+                "scf.energycutoff":self.openmx_cutoff.value(),
+                "scf.Kgrid":" ".join(str(box.value()) for box in self.openmx_kgrid),
+                "scf.ElectronicTemperature":self.openmx_temperature.value(),
+                "scf.criterion":self.openmx_criterion.text(),
+                "scf.maxIter":self.openmx_maxiter.value()}
+
+    def set_openmx_values(self, values):
+        widgets=(self.openmx_xc,self.openmx_spin,self.openmx_soc,self.openmx_cutoff,
+                 self.openmx_temperature,self.openmx_criterion,self.openmx_maxiter,*self.openmx_kgrid)
+        for widget in widgets: widget.blockSignals(True)
+        try:
+            xc=values["scf.XcType"]
+            if self.openmx_xc.findText(xc)<0: self.openmx_xc.addItem(xc)  # e.g. HSE from a template
+            self.openmx_xc.setCurrentText(xc)
+            self.openmx_spin.setCurrentText(values["scf.SpinPolarization"])
+            self.openmx_soc.setChecked(values["scf.SpinOrbit.Coupling"]=="on")
+            self.openmx_soc.setEnabled(self.openmx_spin.currentText()=="NC")
+            self.openmx_cutoff.setValue(float(values["scf.energycutoff"]))
+            for box,value in zip(self.openmx_kgrid,values["scf.Kgrid"].split()): box.setValue(int(value))
+            self.openmx_temperature.setValue(float(values["scf.ElectronicTemperature"]))
+            self.openmx_criterion.setText(values["scf.criterion"])
+            self.openmx_maxiter.setValue(int(values["scf.maxIter"]))
+        finally:
+            for widget in widgets: widget.blockSignals(False)
+        self.update_openmx_markers()
+
+    def load_openmx_parameters(self, overrides):
+        """Show the target's template values with its saved overrides applied."""
+        template={}
+        if self.current_structure is not None:
+            try: template=core.template_keywords()
+            except OSError: template={}
+        self.openmx_base={key:self.canonical_openmx(key,template.get(key) or core.OPENMX_DEFAULTS[key])
+                          for key in core.OPENMX_KEYWORDS}
+        try:
+            self.openmx_recommended=(core.recommended_openmx_values()
+                                     if self.current_structure is not None else dict(self.openmx_base))
+        except (OSError, ValueError):
+            self.openmx_recommended=dict(self.openmx_base)
+        self.set_openmx_values({**self.openmx_base,**(overrides or {})})
+        self.openmx_tabs.widget(1).setEnabled(self.current_structure is not None)
+
+    def openmx_overrides(self):
+        """Keywords whose widget value differs from the template (invalid input is ignored)."""
+        changed={}
+        for key,value in self.openmx_widget_values().items():
+            try: text=core.normalize_openmx_value(key,value)
+            except ValueError: continue
+            if text!=self.openmx_base.get(key): changed[key]=text
+        return changed
+
+    def update_openmx_markers(self, *_):
+        changed=self.openmx_overrides()
+        for key,label in self.openmx_labels.items():
+            font=label.font(); font.setBold(key in changed); label.setFont(font)
+            label.setToolTip(f"{self.OPENMX_LABELS[key][1]}\nTemplate: {self.openmx_base.get(key, '')}"
+                             f"\nRecommended: {self.openmx_recommended.get(key, '')}")
+        try:
+            core.normalize_openmx_value("scf.criterion",self.openmx_criterion.text()); valid=True
+        except ValueError:
+            valid=False
+        self.openmx_criterion.setStyleSheet("" if valid else "color: #c62828;")
+        current={key:self.canonical_openmx(key,value) for key,value in self.openmx_widget_values().items()}
+        self.openmx_reset.setEnabled(current!=self.openmx_recommended)
+
     def build_menus(self):
         file_menu = self.menuBar().addMenu("File")
         self.add_menu_action(file_menu, "Import CIF…", self.import_cif)
         self.add_menu_action(file_menu, "Open calculation target folder…", self.open_structure_folder)
         self.add_menu_action(file_menu, "Save parameter.json", self.save_selected_settings)
+        file_menu.addSeparator()
+        self.open_result_action = self.add_menu_action(file_menu, "Open PAD result (HDF5)…", self.import_pad_result)
+        self.save_result_action = self.add_menu_action(file_menu, "Save PAD result as HDF5…", self.export_pad_result)
         file_menu.addSeparator(); self.add_menu_action(file_menu, "Exit", self.close)
 
         calc_menu = self.menuBar().addMenu("Calculation")
@@ -1199,6 +1810,15 @@ class Window(QtWidgets.QMainWindow):
         self.add_menu_action(exchange_menu, "Import downloaded results…", self.import_download_results)
         self.add_menu_action(exchange_menu, "Open upload folder", lambda: self.open_path(UPLOAD))
         self.add_menu_action(exchange_menu, "Open download folder", lambda: self.open_path(DOWNLOAD))
+
+        settings_menu = self.menuBar().addMenu("Settings")
+        self.preferences_action = self.add_menu_action(settings_menu, "Preferences…", self.show_preferences)
+        keys = QtGui.QKeySequence.keyBindings(QtGui.QKeySequence.StandardKey.Preferences)
+        self.preferences_action.setShortcuts(keys or [QtGui.QKeySequence("Ctrl+,")])  # ⌘, on macOS
+        # Keep the action in this menu; macOS would otherwise move any
+        # "Preferences…" item into the application menu by text heuristics.
+        self.preferences_action.setMenuRole(QtGui.QAction.MenuRole.NoRole)
+        self.add_menu_action(settings_menu, "Open data folder", lambda: self.open_path(STRUCTURES))
 
         view_menu = self.menuBar().addMenu("View")
         self.add_menu_action(view_menu, "Reload calculation results", self.refresh_results)
@@ -1221,9 +1841,10 @@ class Window(QtWidgets.QMainWindow):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.resolve())))
 
     def refresh_structures(self):
-        entries = structure_entries(); selected = self.current_structure.name if self.current_structure else None
+        entries = structure_entries()
+        selected = self.current_structure.name if self.current_structure else self._preferred_structure
         self.structure_combo.blockSignals(True); self.structure_combo.clear()
-        if not entries: self.structure_combo.addItem("(Place a CIF file under structures)", None)
+        if not entries: self.structure_combo.addItem(f"(Import a CIF into {STRUCTURES.name})", None)
         else:
             for path in entries: self.structure_combo.addItem(path.name, str(path))
             index = next((i for i, path in enumerate(entries) if path.name == selected), 0)
@@ -1249,6 +1870,7 @@ class Window(QtWidgets.QMainWindow):
                 self.save_structure_settings(previous_structure)
             except (OSError, ValueError) as exc:
                 self.append_log(f"Could not save PAD parameters: {previous_structure.name}: {exc}")
+        self.cancel_background_display()
         self.current_structure = next_structure
         self.result = None
         preferred_result = None
@@ -1262,7 +1884,9 @@ class Window(QtWidgets.QMainWindow):
                 # companion settings file lazily so renaming the CIF is not
                 # part of the normal workflow.
                 if not settings_path.is_file():
-                    write_settings(settings_path, self.initial_settings)
+                    # PAD settings carry over; OpenMX keyword overrides are
+                    # material-specific, so a new target starts from its CIF.
+                    write_settings(settings_path, dict(self.initial_settings, openmx={}, band_window=None))
                 selected_settings = read_settings(settings_path)
                 self.apply_settings(selected_settings)
                 # Migrate a completed local first-BZ cache created before the
@@ -1277,8 +1901,14 @@ class Window(QtWidgets.QMainWindow):
                 self.message.setText(f"Could not load settings: {exc}")
         else:
             configure_runtime_paths(DEFAULT_STRUCTURE)
-            core.configure_structure(None)
-            LATTICE = core.LATTICE; B = core.G
+            try:
+                core.configure_structure(None)
+                LATTICE = core.LATTICE; B = core.G
+            except (OSError, ValueError, RuntimeError):
+                # An empty data folder has no default graphite structure.
+                # Keep the previous lattice until a CIF is imported.
+                pass
+            self.load_openmx_parameters({})  # disabled until a target exists
         self.refresh_results(preferred_result)
 
     def apply_settings(self, settings):
@@ -1295,6 +1925,7 @@ class Window(QtWidgets.QMainWindow):
         self.direction.setCurrentText(settings["direction"]); self.polarization.setCurrentText(settings["polarization"])
         self.pad_engine.setCurrentIndex(self.pad_engine.findData(settings["pad_engine"]))
         self.show_bz.setChecked(settings["show_bz"]); self.bz_action.setChecked(settings["show_bz"])
+        self.load_openmx_parameters(settings["openmx"]); self.set_band_window(settings["band_window"])
         self.update_mesh_labels(); self.direction_changed(); self.update_eb_input()
 
     def refresh_results(self, selected=None):
@@ -1368,7 +1999,7 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Import CIF", "Please select a CIF file."); return
         default_name = safe_name(source.stem)
         name, ok = QtWidgets.QInputDialog.getText(
-            self, "Import CIF", "Folder name to create under structures:",
+            self, "Import CIF", f"Folder name to create in the data folder ({STRUCTURES}):",
             QtWidgets.QLineEdit.EchoMode.Normal, default_name)
         if not ok or not name.strip(): return
         target = STRUCTURES / safe_name(name)
@@ -1406,6 +2037,282 @@ class Window(QtWidgets.QMainWindow):
 
     def open_structure_folder(self):
         self.open_path(self.current_structure or STRUCTURES)
+
+    def store_session(self):
+        """Save the GUI parameters and window state for the next start."""
+        if not self.persist_session:
+            return
+        try:
+            settings = validate_settings(self.settings())
+        except ValueError as exc:
+            self.append_log(f"Could not save the window state: {exc}"); return
+        pending = self._pending_display or {}
+        state = {
+            "structure": self.current_structure.name if self.current_structure else None,
+            "eb": self.eb() if self.result else pending.get("eb"),
+            # A result opened from a file is shown again instead of the last
+            # calculated one.
+            "result_file": (self.result or {}).get("source_file") or pending.get("source_file"),
+            "parameter_tab": self.parameter_tabs.currentIndex(),
+            "openmx_tab": self.openmx_tabs.currentIndex(),
+            "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+        }
+        try:
+            save_session(settings, state)
+        except (OSError, ValueError) as exc:
+            self.append_log(f"Could not save the window state: {exc}")
+
+    def restore_session(self):
+        """Restore the state saved by store_session() and show the last PAD result."""
+        state = self._session; self._preferred_structure = None
+        name = self.current_structure.name if self.current_structure else None
+        same_target = state.get("structure") == name
+        if same_target and state:
+            # Selecting the target applied its parameter.json and saved result
+            # settings; the values shown at exit take precedence.
+            self.apply_settings(self.startup_settings)
+        for tabs, key in ((self.parameter_tabs, "parameter_tab"), (self.openmx_tabs, "openmx_tab")):
+            index = state.get(key)
+            if isinstance(index, int) and 0 <= index < tabs.count():
+                tabs.setCurrentIndex(index)
+        if isinstance(state.get("geometry"), str):
+            self.restoreGeometry(QtCore.QByteArray.fromBase64(state["geometry"].encode("ascii")))
+        if self.current_structure is None:
+            return
+        candidates = [self.current_structure / "cache" / LAST_PAD_RESULT]
+        if same_target and state.get("result_file"):
+            candidates.insert(0, Path(state["result_file"]))
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                result = load_pad_result(path)
+            except ValueError as exc:
+                self.append_log(f"Could not show the saved PAD result: {exc}"); continue
+            if result.get("structure_name") not in (None, name):
+                continue
+            result["structure_name"] = name
+            gui = validate_settings(self.settings())
+            # Display-only edits made after the calculation (Gaussian widths,
+            # EF shift, θmax, boundary) are kept; otherwise show the result as
+            # it was calculated.
+            display = gui if can_reuse_display(result, gui) else result["s"]
+            self.append_log(f"[PAD result restored] {path}")
+            self.display_in_background(
+                result, display, state.get("eb") if same_target else None,
+                f"Restored PAD result of {name} (calculated {result.get('created') or 'earlier'})")
+            return
+
+    def display_in_background(self, result, settings, eb=None, message=None):
+        """Apply Gaussian dK/dE to a loaded result off the GUI thread, then show it.
+
+        Smoothing a large volume takes seconds, so the window stays usable
+        meanwhile.  Calc, another file or another target cancels the job.
+        """
+        self.cancel_background_display()
+        self._display_job += 1; job = self._display_job
+        self._pending_display = dict(job=job, target=self.current_structure, eb=eb, message=message,
+                                     source_file=result.get("source_file"))
+        self.progress.setRange(0, 0); self.progress.setFormat("Loading PAD result…")
+        self.message.setText("Applying Gaussian dK/dE to the saved PAD result…")
+        relay = self._display_relay
+        def run():
+            try:
+                view, error = prepare_display(result, settings, lambda: job != self._display_job), None
+            except core.Cancelled:
+                return
+            except Exception:
+                view, error = None, traceback.format_exc()
+            try:
+                relay.ready.emit(job, view, error)
+            except RuntimeError:  # the window was closed meanwhile
+                pass
+        threading.Thread(target=run, name="pad-result-display", daemon=True).start()
+
+    def cancel_background_display(self):
+        if self._pending_display is None:
+            return
+        self._display_job += 1; self._pending_display = None
+        self.progress.setRange(0, 100); self.progress.setValue(0); self.progress.setFormat("Idle")
+
+    def background_display_ready(self, job, view, error):
+        pending = self._pending_display
+        if pending is None or pending["job"] != job:
+            return
+        self._pending_display = None
+        self.progress.setRange(0, 100)
+        if self.thread is not None or self.current_structure != pending["target"]:
+            return
+        if error:
+            self.progress.setValue(0); self.progress.setFormat("Could not show the PAD result")
+            self.message.setText("Could not show the PAD result (see the log)"); self.append_log(error); return
+        self.progress.setValue(100); self.progress.setFormat("PAD result loaded")
+        self.show_result(view, pending["eb"])
+        if pending["message"]:
+            self.message.setText(pending["message"])
+
+    def show_result(self, result, eb=None):
+        """Display a complete result and match the EB slider to its energies."""
+        self._stop_eb_sweep()
+        s = result["s"]; count = len(energies(s))
+        target = self.eb() if eb is None else float(eb)
+        self._slider_min = s["eb_min"]; self._slider_step = s["de"]
+        self.slider.blockSignals(True); self.slider.setRange(0, count - 1)
+        self.slider.setValue(int(np.clip(round((target - self._slider_min) / self._slider_step), 0, count - 1)))
+        self.slider.blockSignals(False); self.update_eb_input()
+        self.result = result; self.update_mesh_result(result); self.redraw()
+
+    def export_pad_result(self):
+        """Save the displayed PAD result to a self-contained HDF5 file."""
+        result = self.result
+        if not pad_result_complete(result):
+            QtWidgets.QMessageBox.information(
+                self, "Save PAD result", "There is no complete PAD result to save. Press Calc first."); return
+        s = result["s"]; name = result.get("structure_name") or "pad"
+        folder = self.current_structure or STRUCTURES
+        default = folder / f"{safe_name(name)}_hv{s['hv']:g}eV_{datetime.now():%Y%m%d-%H%M%S}.h5"
+        selected, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PAD result", str(default), PAD_RESULT_FILTER)
+        if not selected:
+            return
+        path = Path(selected)
+        if path.suffix.lower() not in (".h5", ".hdf5"):
+            path = path.with_name(path.name + ".h5")
+        structure = (self.current_structure if self.current_structure is not None
+                     and self.current_structure.name == result.get("structure_name") else None)
+        try:
+            save_pad_result(path, result, structure)
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.critical(self, "Save PAD result", str(exc)); return
+        self.message.setText(f"PAD result saved: {path}\n{format_file_size(path.stat().st_size)}")
+
+    def import_pad_result(self):
+        if self.thread:
+            QtWidgets.QMessageBox.information(
+                self, "Open PAD result", "Wait for the calculation to finish, or cancel it, first."); return
+        selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open PAD result", str(self.current_structure or STRUCTURES), PAD_RESULT_FILTER)
+        if selected:
+            self.open_pad_result(Path(selected))
+
+    def open_pad_result(self, path):
+        """Show a saved PAD result with its calculation target and parameters."""
+        try:
+            result = load_pad_result(path)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.critical(self, "Open PAD result", str(exc)); return False
+        name = result.get("structure_name")
+        target = STRUCTURES / safe_name(name) if name else None
+        stored = (result.get("structure") or {}).get("cif")
+        note = ""
+        if target is None or structure_cif_path(target) is None:
+            if target is None or not stored:
+                QtWidgets.QMessageBox.warning(
+                    self, "Open PAD result", "The file does not contain its crystal structure (CIF)."); return False
+            answer = QtWidgets.QMessageBox.question(
+                self, "Open PAD result",
+                f"The calculation target “{target.name}” is not in the data folder.\n"
+                f"Add it from the crystal structure saved in this file?\n\n{target}",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Yes)
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return False
+            try:
+                self.add_target_from_result(target, result)
+            except (OSError, ValueError, RuntimeError) as exc:
+                QtWidgets.QMessageBox.critical(self, "Open PAD result", str(exc)); return False
+            note = f"\nAdded calculation target: {target}"
+        elif stored and structure_files(target).get("cif") != stored:
+            note = "\nNote: the CIF in the data folder differs from the one saved in the file."
+        self.refresh_structures()
+        index = self.structure_combo.findData(str(target))
+        if index < 0:
+            QtWidgets.QMessageBox.warning(self, "Open PAD result", f"Calculation target not found: {target}"); return False
+        self.structure_combo.setCurrentIndex(index)
+        result["structure_name"] = target.name
+        self.apply_settings(result["s"])
+        self.display_in_background(result, result["s"], None,
+                                   f"PAD result opened: {Path(path).name}\n"
+                                   f"{target.name}, calculated {result.get('created') or 'earlier'}{note}")
+        return True
+
+    @staticmethod
+    def add_target_from_result(target, result):
+        """Create a calculation target from the structure stored in a result file."""
+        structure = result["structure"]
+        cif_name = Path(structure.get("cif_name") or "structure.cif").name
+        if not cif_name.lower().endswith(".cif"):
+            cif_name = "structure.cif"
+        created = not target.exists()
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            (target / cif_name).write_text(structure["cif"])
+            if structure.get("openmx_template"):
+                # Written after the CIF so it is not regenerated by cif2omx.
+                (target / ".openmx.base.dat").write_text(structure["openmx_template"])
+            (target / "results" / "openmx").mkdir(parents=True, exist_ok=True)
+            write_settings(target / "parameter.json", result["s"])
+            core.configure_structure(target)
+        except Exception:
+            if created:
+                shutil.rmtree(target, ignore_errors=True)
+            raise
+
+    def euler_angles(self):
+        return tuple(box.value() for box in (self.alpha, self.beta, self.gamma))
+
+    def choose_euler_preset(self):
+        """Set the incident angles (Euler a, b, c) from the beamline chosen in EulerPresetDialog."""
+        dialog = EulerPresetDialog(self.euler_angles(), self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        angles = dialog.angles()
+        if angles is not None:
+            for box, value in zip((self.alpha, self.beta, self.gamma), angles):
+                box.setValue(value)
+
+    def show_preferences(self):
+        dialog = PreferencesDialog(STRUCTURES, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.data_folder()
+        if selected is None:
+            QtWidgets.QMessageBox.warning(self, "Preferences", "Enter a data folder."); return
+        self.change_data_folder(selected)
+
+    def change_data_folder(self, folder):
+        """Switch structure discovery and all OpenMX/PAD output to another folder."""
+        folder = Path(folder).expanduser()
+        if self.thread:
+            QtWidgets.QMessageBox.information(
+                self, "Preferences",
+                "The data folder cannot be changed while a calculation is running."); return False
+        if not folder.is_dir():
+            if folder.exists():
+                QtWidgets.QMessageBox.warning(self, "Preferences", f"Not a folder: {folder}"); return False
+            answer = QtWidgets.QMessageBox.question(
+                self, "Create data folder", f"The folder does not exist:\n{folder}\n\nCreate it?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.Yes)
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return False
+            try:
+                folder.mkdir(parents=True)
+            except OSError as exc:
+                QtWidgets.QMessageBox.critical(self, "Create data folder", str(exc)); return False
+        try:
+            save_data_folder(folder)
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.critical(self, "Preferences", f"Could not save the data folder: {exc}"); return False
+        if folder.resolve() == STRUCTURES:
+            return True
+        self._stop_eb_sweep()
+        # refresh_structures() saves the previous target's parameter.json in
+        # the old folder before selecting a target inside the new one.
+        set_data_folder(folder)
+        self.update_data_folder_button()
+        self.refresh_structures()
+        self.message.setText(f"Data folder: {STRUCTURES}\n" + self.message.text())
+        return True
 
     def save_selected_settings(self):
         path = (self.current_structure / "parameter.json") if self.current_structure else None
@@ -1485,6 +2392,11 @@ class Window(QtWidgets.QMainWindow):
     def direction_changed(self):
         a,b={"kx":("ky fixed (Å⁻¹)","kz fixed (Å⁻¹)"),"ky":("kx fixed (Å⁻¹)","kz fixed (Å⁻¹)"),"kz":("kx fixed (Å⁻¹)","ky fixed (Å⁻¹)")}[self.direction.currentText()]
         self.la.setText(a); self.lb.setText(b)
+        # For kx and ky slices kz is set by the photoemission sphere at each EB
+        # (PAD slice and band diagram), so the second coordinate is unused.
+        sphere=self.direction.currentText()!="kz"
+        self.b.setEnabled(not sphere); self.lb.setEnabled(not sphere)
+        self.b.setToolTip("Not used: kz follows the photoemission sphere (hν, V0, EB) along the slice" if sphere else "")
     def update_eb_input(self):
         shift=self.ef_shift.value()
         maximum=self._slider_min+self.slider.maximum()*self._slider_step
@@ -1501,7 +2413,11 @@ class Window(QtWidgets.QMainWindow):
         self.eb_input.blockSignals(False)
     def slider_changed(self):
         self.eb_input.blockSignals(True); self.eb_input.setValue(self.eb()+self.ef_shift.value())
-        self.eb_input.blockSignals(False); self.redraw()
+        self.eb_input.blockSignals(False)
+        if self.slider.isSliderDown():
+            self._eb_view_timer.start()  # while dragging, draw only the latest position
+        else:
+            self.update_eb_view()
     def set_eb_sweep_running(self, running):
         self.play_eb_button.setEnabled(not running and self.thread is None)
         self.stop_eb_button.setEnabled(running)
@@ -1576,7 +2492,8 @@ class Window(QtWidgets.QMainWindow):
                 "k_min":self.k_min.value(),"k_max":self.k_max.value(),
                 "k_step":self.k_step.value(),
                 "show_bz":self.show_bz.isChecked(),
-                "pad_engine":self.pad_engine.currentData(), "use_first_bz_only":True, **{f"N{i+1}": box.value() for i,box in enumerate(self.nboxes)}}
+                "pad_engine":self.pad_engine.currentData(), "use_first_bz_only":True, **{f"N{i+1}": box.value() for i,box in enumerate(self.nboxes)},
+                "openmx":self.openmx_overrides(),"band_window":self.band_window_setting()}
     def save_settings(self):
         selected, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export settings parameter file",
@@ -1589,6 +2506,10 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Settings save error", str(exc))
             return
         self.message.setText(f"Settings exported: {selected}")
+    def update_data_folder_button(self):
+        self.data_folder_button.setText(path_tail(STRUCTURES, DATA_FOLDER_BUTTON_CHARS))
+        self.data_folder_button.setToolTip(
+            f"{STRUCTURES}\nClick to change the data folder (Settings > Preferences…)")
     def update_mesh_labels(self):
         ns=[box.value() for box in self.nboxes]
         for i,label in enumerate(self.glabels):
@@ -1618,6 +2539,10 @@ class Window(QtWidgets.QMainWindow):
                 self.progress.setValue(100); self.progress.setFormat("Smoothing complete")
                 self.message.setText(f"Gaussian update: {self.result['smoothing_seconds']:.3f}s\nReused saved PAD (no OpenMX or PAD calculation)")
                 return
+            if self.current_structure is None and structure_cif_path(DEFAULT_STRUCTURE) is None:
+                # Never let OpenMX write outside a real structure in the data folder.
+                raise ValueError(f"No calculation target in the data folder:\n{STRUCTURES}\n"
+                                 "Import a CIF first (File > Import CIF…).")
             v0=(automatic_v0(SCF_H5, settings["v0"])
                 if self.current_structure is None else (settings["v0"] if settings["v0"] > 0 else 20.0))
             if settings["hv"]+v0-settings["eb_max"] <= 0:
@@ -1638,6 +2563,7 @@ class Window(QtWidgets.QMainWindow):
         self.slider.blockSignals(True); self.slider.setRange(0,len(energies(settings))-1)
         self.slider.setValue(int(np.clip(round((old-self._slider_min)/self._slider_step),0,self.slider.maximum())))
         self.slider.blockSignals(False); self.update_eb_input()
+        self.cancel_background_display()
         self.result=None; self.logview.clear(); self.progress.setValue(0); self.progress.setFormat("%p%")
         if selected_result:
             self.message.setText(f"Preparing PAD with updated conditions using saved eigenstates: {Path(selected_result).name}")
@@ -1646,7 +2572,7 @@ class Window(QtWidgets.QMainWindow):
         self.calc.setEnabled(False); self.calc_action.setEnabled(False); self.cancel_action.setEnabled(True)
         self.play_eb_button.setEnabled(False)
         self.thread=QtCore.QThread(self)
-        self.worker=Worker(settings, self.current_structure)
+        self.worker=Worker(settings, self.current_structure, save_last=self.persist_session)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.status.connect(self.message.setText); self.worker.progress.connect(self.progress.setValue)
@@ -1668,6 +2594,7 @@ class Window(QtWidgets.QMainWindow):
             self.save_structure_settings()
         except (OSError, ValueError) as exc:
             self.append_log(f"Could not save PAD parameters on exit: {exc}")
+        self.store_session()
         if self.thread:
             self._closing=True; self.stop_calculation(); event.ignore()
         else: event.accept()
@@ -1742,7 +2669,62 @@ class Window(QtWidgets.QMainWindow):
                                                      lambda ek: shifted_total-ek))
         right.set_ylabel("material Ek = hν+V0−(EB′−EF shift) (eV)")
         return right
+    @staticmethod
+    def eb_map_values(s, eb, data, name, axis):
+        """kx-ky map of one EB slice; PAD outside the emission cone is hidden."""
+        values=data[name]
+        if name=='pad':
+            vacuum=(s['hv']-eb-s['wfnc'])/H2M
+            visible=(vacuum>0)&(axis[:,None]**2+axis[None,:]**2 <= vacuum*math.sin(math.radians(s['theta_max']))**2)
+            values=np.where(visible,values,np.nan)
+        return values
+
+    @staticmethod
+    def map_title(name, eb_display):
+        """Title of the kx-ky map of the band weight ('band_weight') or the PAD."""
+        prefix = "Band Slice " if name == "band_weight" else "PAD: "
+        return f"{prefix}EB′={eb_display:g} eV"
+
+    def update_eb_view(self):
+        """EB change: update only the EB-dependent artists and blit them.
+
+        The kx-ky maps (with colorbars and titles) and the EB marker lines are
+        the only parts that depend on the selected EB; the full figure is
+        rebuilt only when the result or display settings change.
+        """
+        view=self._eb_artists; r=self.result
+        if view is None or r is not view['result']:
+            self.redraw(); return
+        s=r['s']; eb=round(self.eb(),8); data=r['maps'].get(eb)
+        if data is None:
+            self.redraw(); return
+        eb_display=eb+s.get('ef_shift',0.0)
+        for item in view['maps']:
+            values=self.eb_map_values(s,eb,data,item['name'],view['axis'])
+            item['image'].set_data(values)
+            top=float(np.nanmax(values)) if np.isfinite(values).any() else 0.0
+            item['image'].set_clim(0,top if top>0 else 1.0)  # as imshow(vmin=0) autoscales
+            item['ax'].set_title(self.map_title(item['name'],eb_display))
+        for line in view['lines']:
+            line.set_ydata([eb_display,eb_display])
+        if self._eb_background is None:
+            self.canvas.draw_idle(); return  # first full draw still pending
+        fig=self.canvas.figure
+        self.canvas.restore_region(self._eb_background)
+        for artist in view['animated']: fig.draw_artist(artist)
+        self.canvas.blit(fig.bbox)
+
+    def on_canvas_draw(self, event):
+        """After a full draw keep the static background, then add the EB artists."""
+        view=self._eb_artists
+        if view is None or event.canvas is not self.canvas:
+            self._eb_background=None; return
+        fig=self.canvas.figure
+        self._eb_background=self.canvas.copy_from_bbox(fig.bbox)
+        for artist in view['animated']: fig.draw_artist(artist)
+
     def redraw(self):
+        self._eb_artists=None; self._eb_background=None
         if self.result is None: return
         r=self.result
         if self.current_structure is not None and r.get('structure_name') not in (None, self.current_structure.name):
@@ -1752,36 +2734,33 @@ class Window(QtWidgets.QMainWindow):
         fig=self.canvas.figure; fig.clear(); axes=fig.subplots(3,2).ravel()
         a0,a1,a2,a3,a4,a5=axes
         axis=cartesian_axis(s); extent=(axis[0],axis[-1],axis[0],axis[-1])
+        maps=[]; lines=[]
         for ax,name,cmap,title in ((a0,'band_weight','viridis','Band weight'),(a1,'pad','inferno','PAD')):
+            item=dict(ax=ax,name=name,title=title,image=None,colorbar=None); maps.append(item)
             if data is not None:
-                values=data[name]
-                if name=='pad':
-                    vacuum=(s['hv']-eb-s['wfnc'])/H2M
-                    visible=(vacuum>0)&(axis[:,None]**2+axis[None,:]**2 <= vacuum*math.sin(math.radians(s['theta_max']))**2)
-                    values=np.where(visible,values,np.nan)
+                values=self.eb_map_values(s,eb,data,name,axis)
                 im=ax.imshow(values,origin='lower',extent=extent,cmap=cmap,aspect='equal',vmin=0)
-                fig.colorbar(im,ax=ax,label=title)
+                item['image']=im; item['colorbar']=fig.colorbar(im,ax=ax,label=title)
             else:
                 ax.text(.5,.5,'Waiting for this EB slice',ha='center',transform=ax.transAxes)
             ax.set(xlim=extent[:2],ylim=extent[2:],xlabel='kx (Å⁻¹)',ylabel='ky (Å⁻¹)',
-                   title=f'{title}: EB′={eb_display:g} eV — first-BZ grid reference')
+                   title=self.map_title(name,eb_display))
             self.map_bz(ax)
         ebs=energies(s); display_ebs=np.asarray(ebs)+shift; cuts=r['cuts']
-        for ax,key,cmap,label in ((a2,'band_weight','viridis','Band weight'),(a3,'pad','inferno','PAD')):
-            im=None
+        for ax,key,cmap,label,name in ((a2,'band_weight','viridis','Band weight','Band'),(a3,'pad','inferno','PAD','PAD')):
+            im=None; title=f"{name} Slice {s['direction']}-EB"
             if s['direction']=='kz':
                 ordered=[cuts[e] for e in sorted(cuts)]
                 if ordered:
                     k=np.concatenate([c['k'] for c in ordered]); val=np.concatenate([c[key] for c in ordered])
                     energy=np.array([c['eb']+shift for c in ordered]); valid=np.isfinite(val)
                     if valid.any(): im=ax.scatter(k[valid],energy[valid],c=val[valid],cmap=cmap,s=18,vmin=0)
-                title=f'{label}: sampled kz trajectory'
             else:
                 values=np.full((len(ebs),len(axis)),np.nan)
                 for i,e in enumerate(ebs):
                     if e in cuts: values[i]=cuts[e][key]
                 if np.isfinite(values).any(): im=ax.pcolormesh(axis,display_ebs,values,shading='auto',cmap=cmap,vmin=0)
-                ax.set_xlim(axis[0],axis[-1]); title=f'{label} cut from EB-dependent maps'
+                ax.set_xlim(axis[0],axis[-1])
             if im is not None: fig.colorbar(im,ax=ax,label=label)
             else: ax.text(.5,.5,'No completed / visible points',ha='center',transform=ax.transAxes)
             # EF shift moves the spectra inside a fixed requested display
@@ -1789,15 +2768,18 @@ class Window(QtWidgets.QMainWindow):
             # cancel visually even though the energy coordinates had changed.
             ax.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
                    ylabel='EB′ = EB + EF shift (eV)',title=title)
-            ax.axhline(eb_display,color='cyan',ls='--'); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
-        line=r.get('line')
-        if line:
-            for band in line['bands'].T: a4.plot(line['k'],-band+shift,'k',lw=.8)
-        fixed_names={'kx':('ky','kz'),'ky':('kx','kz'),'kz':('kx','ky')}[s['direction']]
-        fixed_text=f"{fixed_names[0]}={s['a']:.3f}, {fixed_names[1]}={s['b']:.3f} Å⁻¹"
-        a4.set(xlim=(axis[0],axis[-1]),ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
-               ylabel='EB′ = EB + EF shift (eV)',title=f"Fixed-coordinate band cut: {fixed_text} — scalar interpolation")
-        a4.axhline(eb_display,color='red',ls='--'); self.add_ek_axis(a4,s,r['v0']); self.line_bz(a4,s)
+            lines.append(ax.axhline(eb_display,color='cyan',ls='--')); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
+        # Bands at the k points the PAD slice samples (kz on the
+        # photoemission sphere at each EB), see pad_cut_bands().
+        line=r.get('line') or {}
+        if line.get('k') is not None and line.get('bands') is not None:
+            for band in np.asarray(line['bands']).T: a4.plot(line['k'],-band+shift,'k',lw=.8)
+        points=np.asarray(line.get('points',np.zeros((0,2))),dtype=float).reshape(-1,2)
+        if len(points): a4.plot(points[:,0],-points[:,1]+shift,'k.',ms=2)
+        if s['direction']!='kz': a4.set_xlim(axis[0],axis[-1])
+        a4.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
+               ylabel='EB′ = EB + EF shift (eV)',title='Band Diagram (PAD cut)')
+        lines.append(a4.axhline(eb_display,color='red',ls='--')); self.add_ek_axis(a4,s,r['v0']); self.line_bz(a4,s)
         kx=np.linspace(axis[0],axis[-1],401)
         norm=matplotlib.colors.Normalize(s['eb_min'],s['eb_max']); cmap=matplotlib.colormaps['turbo']
         for e in np.linspace(s['eb_min'],s['eb_max'],min(41,len(ebs))):
@@ -1813,6 +2795,10 @@ class Window(QtWidgets.QMainWindow):
         fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm,cmap=cmap),ax=a5,label='EB′ = EB + EF shift (eV)')
         a5.set(xlim=(axis[0],axis[-1]),ylim=(0,max(kz_max,1e-6)),
                xlabel='kx (Å⁻¹)',ylabel='kz (Å⁻¹)',title='kx-kz photoelectron trajectories')
+        if all(item['image'] is not None for item in maps):
+            animated=[a for item in maps for a in (item['ax'],item['colorbar'].ax)]+lines
+            for artist in animated: artist.set_animated(True)
+            self._eb_artists=dict(result=r,maps=maps,lines=lines,animated=animated,axis=axis)
         self.canvas.draw_idle()
 
 
@@ -1840,6 +2826,285 @@ def show_runtime_path_dialog(missing):
     )
 
 
+DATA_FOLDER_SUMMARY = (
+    "The data folder is where SPADExp4D keeps your calculation targets and "
+    "everything calculated for them."
+)
+# (indent level, name, description) rows of the "What is stored" overview.
+DATA_FOLDER_LAYOUT = (
+    (0, "<data folder>/", ""),
+    (1, "graphite/", "one subfolder per calculation target"),
+    (2, "structure.cif", "imported crystal structure"),
+    (2, "parameter.json", "settings of this target"),
+    (2, "cache/", "OpenMX runs and eigenstates (often 100s of MB)"),
+    (3, "last_pad_result.h5", "last PAD result, shown again at the next start"),
+    (2, "results/", "list of finished calculations"),
+)
+DATA_FOLDER_SWITCH_NOTE = (
+    "Switching does not move, copy or delete any data. The previous folder "
+    "stays as it is, and you can switch back at any time."
+)
+
+
+DATA_FOLDER_BUTTON_CHARS = 32  # sidebar button shows only the last N characters
+BAND_WINDOW_HELP = (
+    "Energy range (relative to EF) of the bands stored in the k-space HDF5. "
+    "All keeps every band. A window that covers the EB range of interest "
+    "reduces storage and memory several-fold, e.g. for NC spinors; bands "
+    "outside it are missing from PAD. Changing it recomputes the k-space HDF5."
+)
+OPENMX_RECOMMENDED_HELP = (
+    "Set recommended SCF values for this cell (never weaker than the template):\n"
+    "• scf.Kgrid: k-point spacing of 0.2 Å⁻¹ or finer\n"
+    "• scf.energycutoff ≥ 220 Ry, scf.criterion ≤ 1e-6 Hartree, scf.maxIter ≥ 200\n"
+    "• scf.ElectronicTemperature 300 K\n"
+    "• scf.XcType as in the template (it matches the pseudopotentials)\n"
+    "Each keyword's tooltip shows its template and recommended values."
+)
+OPENMX_PARAMETERS_HELP = (
+    "OpenMX keywords of the selected calculation target, starting from its "
+    ".openmx.base.dat (generated from the CIF). Bold keywords differ from the "
+    "template; they are saved in parameter.json, and the next Calc runs a new "
+    "SCF and k-space HDF5 for them."
+)
+
+
+def path_tail(path, limit):
+    """Return at most `limit` characters of a path, keeping its end."""
+    text = str(path)
+    return text if len(text) <= limit else "…" + text[-(limit - 1):]
+
+
+def calculation_targets(folder):
+    """Names of the calculation targets (subfolders with a CIF) in a data folder."""
+    return sorted(path.name for path in Path(folder).iterdir()
+                  if path.is_dir() and structure_cif_path(path) is not None)
+
+
+def data_folder_status(path, current=None):
+    """Return (usable, level, text) describing a candidate data folder.
+
+    level is "ok", "warning" or "error"; usable is False only when switching
+    to the path is impossible.
+    """
+    if path is None:
+        return False, "error", "Enter a folder path or click Browse…."
+    path = Path(path).expanduser()
+    if path.exists() and not path.is_dir():
+        return False, "error", "This path is a file, not a folder."
+    if not path.is_dir():
+        return True, "warning", ("This folder does not exist yet. It will be created "
+                                 f"inside {nearest_existing_folder(path)}.")
+    try:
+        targets = calculation_targets(path)
+        free = shutil.disk_usage(path).free
+    except OSError as exc:
+        return False, "error", f"This folder cannot be read: {exc.strerror or exc}"
+    is_current = current is not None and path.resolve() == Path(current).resolve()
+    state = "This is the current data folder." if is_current else "Existing folder."
+    if targets:
+        shown = ", ".join(targets[:4]) + (", …" if len(targets) > 4 else "")
+        noun = "calculation target" if len(targets) == 1 else "calculation targets"
+        contents = f"{len(targets)} {noun}: {shown}"
+    else:
+        contents = "No calculation targets yet (add one with File > Import CIF…)"
+    return True, "ok", f"{state}\n{contents}  ·  {free / 1024**3:.1f} GiB free"
+
+
+def nearest_existing_folder(path):
+    """Return the closest existing ancestor of a path, or the home folder."""
+    for candidate in (Path(path).expanduser(), *Path(path).expanduser().parents):
+        if candidate.is_dir():
+            return candidate
+    return Path.home()
+
+
+def choose_data_folder(parent, start):
+    selected = QtWidgets.QFileDialog.getExistingDirectory(
+        parent, "Choose Data Folder", str(nearest_existing_folder(start)))
+    return Path(selected) if selected else None
+
+
+def prompt_for_data_folder(missing, parent=None):
+    """Ask for a data folder when the configured one is unavailable at startup."""
+    missing = Path(missing)
+    default = DEFAULT_DATA_FOLDER
+    offer_default = default.is_dir() and default.resolve() != missing.resolve()
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+    box.setWindowTitle("Data folder not found")
+    box.setText("SPADExp4D cannot find its data folder.")
+    choices = "choose another folder" + (" or use the default folder" if offer_default else "")
+    box.setInformativeText(
+        f"{missing}\n\n"
+        "If it is on an external or network drive, connect the drive and click "
+        f"Retry. Otherwise {choices}.\n\n{DATA_FOLDER_SUMMARY}"
+        + (f"\n\nDefault folder: {default}" if offer_default else ""))
+    choose = box.addButton("Choose Folder…", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+    use_default = (box.addButton("Use Default Folder", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+                   if offer_default else None)
+    retry = box.addButton("Retry", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+    box.addButton("Quit", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(choose)
+    while True:
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is not None and clicked is retry:
+            if missing.is_dir():
+                return missing
+            box.setText("The data folder is still not available.")
+            continue
+        if clicked is not None and clicked is use_default:
+            return default
+        if clicked is not choose:
+            return None
+        selected = choose_data_folder(parent, missing)
+        if selected is not None:
+            return selected
+
+
+def format_euler(angles):
+    return ", ".join(f"{name} = {value:g}°" for name, value in zip("abc", angles))
+
+
+class EulerPresetDialog(QtWidgets.QDialog):
+    """List of beamlines whose Euler angles a, b, c can be applied with OK."""
+
+    def __init__(self, current=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Incident angle presets")
+        self.setMinimumWidth(360)
+        self.list = QtWidgets.QListWidget()
+        for name, angles in EULER_PRESETS:
+            item = QtWidgets.QListWidgetItem(name)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, angles)
+            item.setToolTip(format_euler(angles))
+            self.list.addItem(item)
+        self.list.setMinimumHeight(self.list.sizeHintForRow(0) * (len(EULER_PRESETS) + 1))
+        self.detail = QtWidgets.QLabel()
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.ok_button = buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
+        self.list.currentRowChanged.connect(self.selection_changed)
+        self.list.itemDoubleClicked.connect(lambda _item: self.accept())
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel("Beamline"))
+        layout.addWidget(self.list)
+        layout.addWidget(self.detail)
+        layout.addWidget(buttons)
+        # Start on the preset that matches the current angles, if any.
+        current_row = next((row for row, (_, angles) in enumerate(EULER_PRESETS)
+                            if current is not None and np.allclose(angles, current)), 0)
+        self.list.setCurrentRow(current_row)
+        self.selection_changed()
+
+    def selection_changed(self, *_):
+        angles = self.angles()
+        self.ok_button.setEnabled(angles is not None)
+        self.detail.setText("" if angles is None else format_euler(angles))
+
+    def angles(self):
+        item = self.list.currentItem()
+        if item is None:
+            return None
+        return tuple(float(value) for value in item.data(QtCore.Qt.ItemDataRole.UserRole))
+
+
+class PreferencesDialog(QtWidgets.QDialog):
+    """Application preferences stored in the initialization file."""
+
+    STATUS_SYMBOL = {"ok": "✓", "warning": "⚠", "error": "✗"}
+    STATUS_COLOR = {"ok": None, "warning": "#b26a00", "error": "#c62828"}
+
+    def __init__(self, data_folder, parent=None):
+        super().__init__(parent)
+        self.current = Path(data_folder)
+        self.setWindowTitle("Preferences")
+        self.setMinimumWidth(660)
+
+        heading = QtWidgets.QLabel("Data folder")
+        font = heading.font(); font.setBold(True); font.setPointSizeF(font.pointSizeF() * 1.25)
+        heading.setFont(font)
+        summary = QtWidgets.QLabel(DATA_FOLDER_SUMMARY); summary.setWordWrap(True)
+
+        self.folder_edit = QtWidgets.QLineEdit(str(data_folder))
+        self.folder_edit.setPlaceholderText("Folder path")
+        browse = QtWidgets.QPushButton("Browse…"); browse.clicked.connect(self.browse)
+        row = QtWidgets.QHBoxLayout(); row.addWidget(self.folder_edit, 1); row.addWidget(browse)
+        self.status = QtWidgets.QLabel(); self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        contents = QtWidgets.QGroupBox("What is stored in a data folder")
+        grid = QtWidgets.QGridLayout(contents)
+        grid.setHorizontalSpacing(18); grid.setVerticalSpacing(2); grid.setColumnStretch(1, 1)
+        fixed = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
+        for line, (level, name, description) in enumerate(DATA_FOLDER_LAYOUT):
+            item = QtWidgets.QLabel(name); item.setFont(fixed); item.setIndent(16 * level)
+            grid.addWidget(item, line, 0)
+            if description:
+                grid.addWidget(QtWidgets.QLabel(description), line, 1)
+
+        note = QtWidgets.QLabel(DATA_FOLDER_SWITCH_NOTE); note.setWordWrap(True)
+        try:
+            ini = INITIAL_SETTINGS_FILE.relative_to(PROJECT)
+        except ValueError:
+            ini = INITIAL_SETTINGS_FILE
+        saved = QtWidgets.QLabel(f"This setting is saved in {ini}.")
+        saved.setEnabled(False)  # secondary, greyed text
+
+        reveal = "Show in Finder" if sys.platform == "darwin" else "Open Folder"
+        self.open_button = QtWidgets.QPushButton(reveal); self.open_button.clicked.connect(self.open_folder)
+        self.default_button = QtWidgets.QPushButton("Use Default")
+        self.default_button.setToolTip(str(DEFAULT_DATA_FOLDER))
+        self.default_button.clicked.connect(lambda: self.folder_edit.setText(str(DEFAULT_DATA_FOLDER)))
+        cancel = QtWidgets.QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        self.ok_button = QtWidgets.QPushButton("Use This Folder")
+        self.ok_button.setDefault(True); self.ok_button.clicked.connect(self.accept)
+        buttons = QtWidgets.QHBoxLayout()
+        for widget in (self.open_button, self.default_button):
+            buttons.addWidget(widget)
+        buttons.addStretch(1); buttons.addWidget(cancel); buttons.addWidget(self.ok_button)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(heading); layout.addWidget(summary); layout.addSpacing(4)
+        layout.addLayout(row); layout.addWidget(self.status); layout.addSpacing(6)
+        layout.addWidget(contents); layout.addWidget(note); layout.addWidget(saved)
+        layout.addSpacing(6); layout.addLayout(buttons)
+        self.folder_edit.textChanged.connect(self.update_status)
+        self.update_status()
+
+    def update_status(self):
+        path = self.data_folder()
+        usable, level, text = data_folder_status(path, self.current)
+        color = self.STATUS_COLOR[level]
+        self.status.setStyleSheet(f"color: {color};" if color else "")
+        self.status.setText(f"{self.STATUS_SYMBOL[level]}  {text}")
+        self.ok_button.setEnabled(usable)
+        self.ok_button.setText("Close" if usable and path is not None and path.is_dir()
+                               and path.resolve() == self.current.resolve() else "Use This Folder")
+        self.open_button.setEnabled(path is not None and path.is_dir())
+        self.default_button.setEnabled(path is None or path != DEFAULT_DATA_FOLDER)
+
+    def open_folder(self):
+        path = self.data_folder()
+        if path is not None and path.is_dir():
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def browse(self):
+        selected = choose_data_folder(self, self.folder_edit.text().strip() or STRUCTURES)
+        if selected is not None:
+            self.folder_edit.setText(str(selected))
+
+    def data_folder(self):
+        text = self.folder_edit.text().strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        return path if path.is_absolute() else PROJECT / path
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check',action='store_true')
@@ -1851,7 +3116,12 @@ def main():
     args=parser.parse_args()
     settings=read_settings(args.settings)
     if args.pad_engine: settings["pad_engine"] = args.pad_engine
+    data_folder = configured_data_folder()
     if args.check or args.prepare:
+        if not data_folder.is_dir():
+            parser.error(f'Data folder not found: {data_folder}\n'
+                         f'Choose one in the GUI or set "{DATA_FOLDER_KEY}" in {INITIAL_SETTINGS_FILE}.')
+        set_data_folder(data_folder)
         structure_path = STRUCTURES / safe_name(args.structure)
         if not structure_cif_path(structure_path):
             parser.error(f'No CIF found in structure: {structure_path}')
@@ -1872,8 +3142,16 @@ def main():
     if missing:
         show_runtime_path_dialog(missing)
         return 1
-    window=Window(settings); window.show()
-    if args.smoke_test: QtCore.QTimer.singleShot(500,window.close)
+    if not data_folder.is_dir():
+        selected = prompt_for_data_folder(data_folder)
+        if selected is None:
+            return 1
+        save_data_folder(selected); data_folder = selected
+    set_data_folder(data_folder)
+    window=Window(settings, session=True); window.show()
+    if args.smoke_test:
+        window.persist_session=False  # check the restore path without saving
+        QtCore.QTimer.singleShot(500,window.close)
     sys.exit(app.exec())
 
 
