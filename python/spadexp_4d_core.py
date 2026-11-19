@@ -698,6 +698,29 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
         return final, elapsed
 
 
+ENGINE_BOHR_ANGSTROM = 0.529177  # au_ang of the SPADExp engine (setup.cpp)
+
+
+def openmx_reciprocal(file, fallback=None):
+    """Reciprocal vectors (1/A) of the cell stored by the OpenMX postprocessor.
+
+    The SPADExp engine rebuilds Cartesian k from this cell.  Fractional k
+    coordinates handed to the engine must therefore use the same cell, not the
+    CIF-derived LATTICE: cif2omx rounds the cell to 7 decimals, and the
+    resulting ~1e-8 change of |k| exceeds the engine's curved-sphere tolerance,
+    so those PAD points were silently dropped.
+    """
+    for name in ('Input/UnitCells/Bands', 'Input/UnitCells/Atoms'):
+        if isinstance(file.get(name), h5py.Dataset):
+            cell = np.asarray(file[name][:], dtype=float)
+            unit = file[name].parent.attrs.get('Unit', 'Ang')
+            unit = unit.decode() if isinstance(unit, (bytes, np.bytes_)) else str(unit)
+            if unit.lower() != 'ang':
+                cell = cell * ENGINE_BOHR_ANGSTROM
+            return 2 * np.pi * np.linalg.inv(cell).T
+    return G if fallback is None else fallback
+
+
 class EigenstateGrid:
     """Periodic nearest-neighbour reference without mixing eigenvector gauges."""
     def __init__(self, path):
@@ -707,6 +730,8 @@ class EigenstateGrid:
         self.ns = np.asarray(self.file["Mesh"].attrs["Divisions"], dtype=int)
         self.paths = lcao_paths(self.file)
         self.ef = float(self.file['Output'].attrs['EF_Eh'])
+        # Cell used by OpenMX and by the PAD engine for fractional -> Cartesian.
+        self.reciprocal = openmx_reciprocal(self.file)
 
     def close(self):
         self.file.close()
@@ -783,7 +808,8 @@ class EigenstateGrid:
                 k = inp.create_group('Kpath'); k.attrs.update(attrs)
                 k.attrs.update(Count=len(indices), minN=BANDS[0], maxN=BANDS[1], FirstBZFolded=np.uint8(1),
                                UniqueCount=len(np.unique(indices)), StateSampling='periodic nearest neighbour')
-                k.create_dataset('Coordinates', data=np.asarray(cartesian) @ np.linalg.inv(G))
+                k.create_dataset('Coordinates',
+                                 data=np.asarray(cartesian) @ np.linalg.inv(self.reciprocal))
                 k.create_dataset('SampledFirstBZCoordinates', data=self.points[indices])
                 k.create_dataset('MeshIndex', data=indices)
                 k.create_dataset('SamplingDistance_Ainv', data=errors)

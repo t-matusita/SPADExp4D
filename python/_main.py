@@ -492,8 +492,9 @@ def pad_ok(path, hv, v0, wf, dimension, eb_min, eb_max, de, gaussian_de,
     except (OSError, KeyError):
         return False
 
-def frac(kcart):
-    return np.asarray(kcart) @ np.linalg.inv(B)
+def frac(kcart, reciprocal=None):
+    """Cartesian (1/A) -> fractional; pass the grid's OpenMX cell for engine input."""
+    return np.asarray(kcart) @ np.linalg.inv(B if reciprocal is None else reciprocal)
 
 def gaussian_smooth_axis(values, width, step, axis, mode="edge", stop=None):
     """Convolve one array axis with a normalized Gaussian in physical units."""
@@ -713,6 +714,7 @@ def write_batch_input(path, grid, s, v0, requested):
     """Small request file links the first-BZ database without copying LCAO."""
     count = len(cartesian_axis(s))
     cart, _ = sphere_coordinates(s, v0, requested[0])
+    reciprocal = getattr(grid, 'reciprocal', None)
     with h5py.File(path, 'w') as out:
         inp = out.create_group('Input')
         for name in ('Atomic.Species', 'Atoms.SpeciesAndCoordinates', 'UnitCells'):
@@ -721,12 +723,12 @@ def write_batch_input(path, grid, s, v0, requested):
             out[name] = h5py.ExternalLink(str(grid.path.resolve()), '/' + name)
         k = inp.create_group('Kpath')
         k.attrs.update(Dimension=np.int32(2), Curved=np.uint8(1),
-            Origin=frac((0, 0, math.sqrt((s['hv']+v0-requested[0])/H2M))),
-            Xvector=frac((1, 0, 0)), Yvector=frac((0, 1, 0)),
+            Origin=frac((0, 0, math.sqrt((s['hv']+v0-requested[0])/H2M)), reciprocal),
+            Xvector=frac((1, 0, 0), reciprocal), Yvector=frac((0, 1, 0), reciprocal),
             Xcount=count, Ycount=count, Count=count*count,
             Xrange=[s['k_min'], s['k_max']], Yrange=[s['k_min'], s['k_max']],
             minN=core.BANDS[0], maxN=core.BANDS[1])
-        k.create_dataset('Coordinates', data=cart @ np.linalg.inv(B))
+        k.create_dataset('Coordinates', data=frac(cart, reciprocal))
         group = out.create_group('Batch')
         group.attrs.update(KMin=s['k_min'], KMax=s['k_max'], H2M=H2M, BandHartree_eV=EH, RawSpectrum=1, EnergyStep_eV=s['de'])
         group.create_dataset('BindingEnergies', data=requested)
@@ -798,9 +800,11 @@ def pad_slice(grid, settings, v0, eb, field, log=None, stop=None):
     code = core.request_code(request)
     count = len(cartesian_axis(s))
     cart, valid = sphere_coordinates(s, v0, eb)
+    # Origin and Coordinates must share the cell the engine uses (grid file).
+    reciprocal = getattr(grid, 'reciprocal', None)
     attrs = dict(Dimension=np.int32(2), Curved=np.uint8(1),
-                 Origin=frac((0, 0, math.sqrt(max(s['hv']+v0-eb, 0)/H2M))),
-                 Xvector=frac((1, 0, 0)), Yvector=frac((0, 1, 0)),
+                 Origin=frac((0, 0, math.sqrt(max(s['hv']+v0-eb, 0)/H2M)), reciprocal),
+                 Xvector=frac((1, 0, 0), reciprocal), Yvector=frac((0, 1, 0), reciprocal),
                  Xcount=np.int32(count), Ycount=np.int32(count),
                  Xrange=np.array((s['k_min'], s['k_max'])), Yrange=np.array((s['k_min'], s['k_max'])))
     with tempfile.TemporaryDirectory(prefix='pad_', dir=INPUT) as temporary:
