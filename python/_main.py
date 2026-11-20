@@ -1732,6 +1732,130 @@ class Worker(QtCore.QObject):
             if grid is not None: grid.close()
 
 
+V0_SCAN_LIMIT = 201  # V0 values in one "Calc with changing V0"
+
+
+def v0_scan_values(begin, end, step):
+    """V0 from begin to end (eV) every step, both ends included.
+
+    Raises ValueError, with a message for the dialog, unless begin <= end,
+    step > 0 and end - begin is a whole multiple of step.
+    """
+    if not all(math.isfinite(value) for value in (begin, end, step)):
+        raise ValueError("V0 Begin, End and Step must be numbers.")
+    if begin <= 0:
+        raise ValueError("V0 Begin must be positive.")
+    if end < begin:
+        raise ValueError("V0 End must not be smaller than V0 Begin.")
+    if step <= 0:
+        raise ValueError("V0 Step must be positive.")
+    steps = (end - begin) / step
+    if abs(steps - round(steps)) > 1e-6:
+        raise ValueError(f"V0 End − V0 Begin must be a whole multiple of V0 Step: "
+                         f"({end:g} − {begin:g}) / {step:g} = {steps:.4g}.")
+    count = int(round(steps)) + 1
+    if count > V0_SCAN_LIMIT:
+        raise ValueError(f"{count} V0 values; use at most {V0_SCAN_LIMIT} (a larger V0 Step).")
+    return [round(begin + i * step, 8) for i in range(count)]
+
+
+def pad_slice_view(result):
+    """Only what the PAD Slice panel needs from a (partial) result: the
+    Gaussian dK/dE is applied to the whole (EB, ky, kx) cube as in the main
+    window, then the maps are dropped to keep many V0 values in memory."""
+    view = prepare_display(result, result['s'])
+    return dict(s=view['s'], v0=result['v0'], cuts=view['cuts'],
+                structure_name=result.get('structure_name'),
+                complete=len(result['raw_maps']) == len(energies(result['s'])))
+
+
+class V0ScanWorker(QtCore.QObject):
+    """PAD for several V0 values with the main window's other parameters.
+
+    Each V0 is a complete PAD calculation (all EB, the same engine and the
+    same first-BZ eigenstates); only its PAD slice is kept.
+    """
+    partial = QtCore.pyqtSignal(object)   # slice of the V0 being calculated
+    v0_done = QtCore.pyqtSignal(object)   # slice of a finished V0
+    done = QtCore.pyqtSignal(); error = QtCore.pyqtSignal(str); stopped = QtCore.pyqtSignal()
+    log = QtCore.pyqtSignal(str); progress = QtCore.pyqtSignal(int); status = QtCore.pyqtSignal(str)
+
+    def __init__(self, settings, structure_path, v0_values):
+        super().__init__(); self.s = settings; self.v0_values = list(v0_values)
+        self.structure_path = Path(structure_path) if structure_path else None
+        self.structure_name = self.structure_path.name if self.structure_path else "graphite"
+        self.stop_event = threading.Event()
+
+    def request_stop(self):
+        self.stop_event.set()
+
+    def stage(self, percent, text):
+        self.progress.emit(percent); self.status.emit(text); self.log.emit(text)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        grid = None; stop = self.stop_event.is_set
+        try:
+            configure_runtime_paths(self.structure_path)
+            core.configure_structure(self.structure_path)
+            mkdirs(); core.check_stop(stop)
+            self.stage(0, 'Preparing all first-BZ k points')
+            path, _ = core.ensure_mesh(self.s, log=self.log.emit, stop=stop,
+                progress=lambda done, total: self.stage(0, f'First BZ: {done:,} / {total:,} k points'))
+            grid = core.EigenstateGrid(path)
+            self.log.emit(f'[K-space HDF5] {path}')
+            requested = energies(self.s); components = polarization_components(self.s)
+            cpp = self.s.get('pad_engine', 'cpp') == 'cpp'
+            binary = ensure_cpp_binary(self.log.emit, stop) if cpp else SPADEXP
+            total = len(self.v0_values) * len(components) * len(requested)
+            for index, v0 in enumerate(self.v0_values):
+                core.check_stop(stop)
+                s = dict(self.s, v0=v0)
+                result = dict(s=s, v0=v0, structure_name=self.structure_name, raw_maps={})
+                label = f'V0={v0:g} eV ({index + 1}/{len(self.v0_values)})'
+                self.log.emit(f'[V0 scan] {label}')
+                self.status.emit(f'PAD {label}: 0/{len(requested)} EB')
+                self.partial.emit(pad_slice_view(result))
+                combined = {}; last = [time.monotonic()]
+                def receive_final(data, result=result):
+                    result['raw_maps'][data['eb']] = data
+                    if time.monotonic() - last[0] >= 0.75:
+                        self.partial.emit(pad_slice_view(result)); last[0] = time.monotonic()
+                with core.file_lock(OUTPUT / 'latest_pad.lock'):
+                    for component_index, polarization in enumerate(components):
+                        component_settings = dict(s, polarization=polarization)
+                        field, _ = light_vectors(component_settings)
+                        counted = [0]
+                        def receive(data, component_index=component_index):
+                            counted[0] += 1
+                            finished = (index * len(components) + component_index) * len(requested) + counted[0]
+                            self.progress.emit(int(100 * finished / total))
+                            self.status.emit(f'PAD {label}: {counted[0]}/{len(requested)} EB')
+                            if len(components) == 1:
+                                receive_final(data)
+                            elif component_index == 0:
+                                combined[data['eb']] = dict(data)
+                            else:
+                                receive_final(sum_pad_components(combined.pop(data['eb']), data))
+                        if cpp:
+                            pad_batch(grid, component_settings, v0, requested, field, receive,
+                                      self.log.emit, stop, binary=binary)
+                        else:
+                            for eb in requested:
+                                core.check_stop(stop)
+                                receive(pad_slice(grid, component_settings, v0, eb, field, self.log.emit, stop))
+                core.check_stop(stop)
+                self.v0_done.emit(pad_slice_view(result))
+            self.stage(100, f'Complete: {len(self.v0_values)} V0 values')
+            self.done.emit()
+        except core.Cancelled:
+            self.stopped.emit()
+        except Exception:
+            self.error.emit(traceback.format_exc())
+        finally:
+            if grid is not None: grid.close()
+
+
 class DisplayRelay(QtCore.QObject):
     """Delivers a result smoothed in a background thread to the GUI thread."""
     ready = QtCore.pyqtSignal(int, object, object)  # job, display result, error text
@@ -1788,6 +1912,7 @@ class Window(QtWidgets.QMainWindow):
         self._session = read_session() if session else {}
         self._preferred_structure = self._session.get("structure")
         self.result = self.thread = self.worker = None; self._closing = False
+        self.v0_dialog = None  # Calculation > Calc with changing V0…
         self._display_job = 0; self._pending_display = None
         self._display_relay = DisplayRelay(self); self._display_relay.ready.connect(self.background_display_ready)
         self.eb_sweep_timer = QtCore.QTimer(self)
@@ -2187,6 +2312,7 @@ class Window(QtWidgets.QMainWindow):
 
         calc_menu = self.menuBar().addMenu("Calculation")
         self.calc_action = self.add_menu_action(calc_menu, "Calc", self.calculate)
+        self.v0_scan_action = self.add_menu_action(calc_menu, "Calc with changing V0…", self.show_v0_scan)
         self.add_menu_action(calc_menu, "Show calculation log", self.show_log)
         self.cancel_action = self.add_menu_action(calc_menu, "Cancel calculation", self.stop_calculation)
         self.cancel_action.setEnabled(False)
@@ -3065,6 +3191,86 @@ class Window(QtWidgets.QMainWindow):
         self.worker.done.connect(self.thread.quit); self.worker.error.connect(self.thread.quit); self.worker.stopped.connect(self.thread.quit)
         self.thread.finished.connect(self.worker.deleteLater); self.thread.finished.connect(self.cleanup)
         self.thread.start()
+    def show_v0_scan(self):
+        """Calculation > Calc with changing V0…"""
+        if self.v0_dialog is None:
+            self.v0_dialog = V0ScanDialog(self)
+        self.v0_dialog.show(); self.v0_dialog.raise_(); self.v0_dialog.activateWindow()
+
+    def start_v0_scan(self, dialog, v0_values):
+        """Calculate the PAD slice for each V0 with the other parameters of the
+        sidebar; returns False if it did not start."""
+        global LATTICE, B
+        if self.thread:
+            dialog.status.setText("Another calculation is running. Wait for it to finish, or cancel it, first.")
+            return False
+        self._stop_eb_sweep()
+        try:
+            if self.current_structure:
+                configure_runtime_paths(self.current_structure)
+                core.configure_structure(self.current_structure)
+                LATTICE = core.LATTICE; B = core.G
+            settings = validate_settings(self.settings())
+            if self.current_structure is None and structure_cif_path(DEFAULT_STRUCTURE) is None:
+                raise ValueError(f"No calculation target in the data folder:\n{STRUCTURES}\n"
+                                 "Import a CIF first (File > Import CIF…).")
+            lowest = min(v0_values)
+            if settings["hv"] + lowest - settings["eb_max"] <= 0:
+                raise ValueError(f"The kinetic energy inside the material is not positive at EB End "
+                                 f"for V0={lowest:g} eV.")
+            plan = core.mesh_plan(settings)
+            if not plan["reuse"] and not self.confirm_mesh_calculation(settings, plan): return False
+        except core.CifError as exc:
+            self.show_error(f"Cannot calculate {self.current_structure.name if self.current_structure else ''}: "
+                            "its CIF has errors", exc); return False
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(dialog, "Calc with changing V0", str(exc)); return False
+        self.calc.setEnabled(False); self.calc_action.setEnabled(False); self.cancel_action.setEnabled(True)
+        self.play_eb_button.setEnabled(False)
+        self.progress.setValue(0); self.progress.setFormat("%p%")
+        self.message.setText(f"Calc with changing V0: {len(v0_values)} values")
+        self.thread = QtCore.QThread(self)
+        self.worker = worker = V0ScanWorker(settings, self.current_structure, v0_values)
+        worker.moveToThread(self.thread)
+        self.thread.started.connect(worker.run)
+        worker.status.connect(self.message.setText); worker.status.connect(dialog.status.setText)
+        worker.progress.connect(self.progress.setValue); worker.log.connect(self.append_log)
+        worker.partial.connect(dialog.show_progress); worker.v0_done.connect(dialog.add_result)
+        worker.done.connect(dialog.scan_done); worker.stopped.connect(dialog.scan_stopped)
+        worker.error.connect(dialog.scan_failed); worker.error.connect(self.failed)
+        for signal in (worker.done, worker.error, worker.stopped): signal.connect(self.thread.quit)
+        self.thread.finished.connect(worker.deleteLater); self.thread.finished.connect(self.cleanup)
+        self.thread.finished.connect(dialog.scan_finished)
+        self.thread.start()
+        return True
+
+    def slice_panel_geometry(self):
+        """The PAD Slice panel of this window in inches, for drawing it
+        elsewhere at exactly the same size.
+
+        Returns the size of a figure that just holds the panel with its
+        labels, Ek axis and colour bar, the boxes (x0, y0, width, height) of
+        the panel and of the colour bar in that figure, and the screen pixels
+        per inch.  Without a PAD Slice panel on screen a default is used.
+        """
+        fig = self.canvas.figure
+        ppi = fig.dpi / max(getattr(self.canvas, 'device_pixel_ratio', 1) or 1, 1e-9)
+        ax = next((a for a in fig.axes if a.get_title().startswith('PAD Slice')), None)
+        colorbar = None if ax is None else next(
+            (c.colorbar.ax for c in ax.collections if getattr(c, 'colorbar', None) is not None), None)
+        if ax is None or colorbar is None:
+            return dict(size=(5.95, 4.4), ax=(0.85, 0.6, 3.4, 3.4), colorbar=(5.0, 0.6, 0.17, 3.4),
+                        ppi=ppi, measured=False)
+        if fig.stale:
+            self.canvas.draw()  # place the panels (constrained layout) first
+        renderer = self.canvas.get_renderer(); dpi = fig.dpi; pad = 0.06
+        tight = matplotlib.transforms.Bbox.union([ax.get_tightbbox(renderer), colorbar.get_tightbbox(renderer)])
+        def box(axes):
+            b = axes.get_position(original=False).transformed(fig.transFigure)
+            return ((b.x0 - tight.x0) / dpi + pad, (b.y0 - tight.y0) / dpi + pad, b.width / dpi, b.height / dpi)
+        return dict(size=(tight.width / dpi + 2 * pad, tight.height / dpi + 2 * pad),
+                    ax=box(ax), colorbar=box(colorbar), ppi=ppi, measured=True)
+
     def stop_calculation(self):
         if self.worker:
             self.worker.request_stop(); self.cancel_action.setEnabled(False); self.message.setText("Stopping…")
@@ -3608,6 +3814,132 @@ class EulerPresetDialog(QtWidgets.QDialog):
         """Parameters other than the angles that the chosen beamline sets (wfnc)."""
         item = self.list.currentItem()
         return {} if item is None else dict(PRESET_SETTINGS.get(item.text(), {}))
+
+
+class V0ScanDialog(QtWidgets.QDialog):
+    """Calculation > Calc with changing V0…
+
+    Calculates the PAD slice (kx-EB or ky-EB, from Slice direction) for V0
+    from V0 Begin to V0 End every V0 Step, with all other parameters taken
+    from the sidebar.  The slice being calculated is shown as it fills; once
+    finished, Current V0 shows each V0.  The graph is drawn at exactly the
+    size of the PAD Slice panel of the main window.
+    """
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window; self.results = {}; self.v0_values = []; self.running = False; self.geometry = None
+        self.setWindowTitle("Calc with changing V0")
+        self.begin = window.spin(10.0, 0.001, 1000)
+        self.end = window.spin(12.0, 0.001, 1000)
+        self.step = window.spin(0.5, 0.001, 1000)
+        self.calc_button = QtWidgets.QPushButton("Calc")
+        self.calc_button.setToolTip("Calculate the PAD slice for each V0 with the other parameters of the "
+                                    "main window; press again to stop")
+        self.calc_button.clicked.connect(self.calc_clicked)
+        self.current = QtWidgets.QComboBox()
+        self.current.setToolTip("Calculated V0 values: choose one to show its PAD slice")
+        self.current.currentIndexChanged.connect(self.current_changed)
+        self.status = QtWidgets.QLabel(); self.status.setWordWrap(True)
+        self.figure = Figure(); self.canvas = FigureCanvasQTAgg(self.figure)
+        form = QtWidgets.QFormLayout()
+        form.addRow("V0 Begin (eV)", self.begin)
+        form.addRow("V0 End (eV)", self.end)
+        form.addRow("V0 Step (eV)", self.step)
+        form.addRow(self.calc_button)
+        form.addRow("Current V0 (eV)", self.current)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form); layout.addWidget(self.status)
+        layout.addWidget(self.canvas, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        # The dialog follows the canvas, which has the size of the main panel.
+        layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetFixedSize)
+        self.set_running(False)
+        self.draw(None)
+
+    def set_running(self, running):
+        self.running = running
+        self.calc_button.setText("Stop" if running else "Calc")
+        for box in (self.begin, self.end, self.step):
+            box.setEnabled(not running)
+        self.current.setEnabled(not running and self.current.count() > 0)
+
+    def calc_clicked(self):
+        if self.running:
+            self.window.stop_calculation(); self.status.setText("Stopping…"); return
+        for box in (self.begin, self.end, self.step):
+            box.interpretText()
+        try:
+            values = v0_scan_values(self.begin.value(), self.end.value(), self.step.value())
+        except ValueError as exc:
+            self.status.setText(f"⚠ {exc}"); return
+        self.results = {}; self.v0_values = values
+        self.current.blockSignals(True); self.current.clear(); self.current.blockSignals(False)
+        self.geometry = self.window.slice_panel_geometry()
+        self.status.setText(f"Calculating {len(values)} V0 values: {values[0]:g} to {values[-1]:g} eV")
+        if self.window.start_v0_scan(self, values):
+            self.set_running(True)
+        else:
+            self.set_running(False)
+
+    def show_progress(self, view):
+        """Slice of the V0 being calculated (partly filled)."""
+        self.draw(view)
+
+    def add_result(self, view):
+        v0 = view['v0']; self.results[v0] = view
+        self.current.blockSignals(True)
+        self.current.addItem(f"{v0:g}", v0); self.current.setCurrentIndex(self.current.count() - 1)
+        self.current.blockSignals(False)
+        self.draw(view)
+
+    def scan_done(self):
+        self.status.setText(f"Complete: {len(self.results)} V0 values. Choose Current V0 to show each.")
+
+    def scan_stopped(self):
+        self.window.progress.setFormat("Stopped")
+        self.status.setText(f"Stopped: {len(self.results)} of {len(self.v0_values)} V0 values calculated.")
+
+    def scan_failed(self, text):
+        self.status.setText("Calculation failed; see the message and the log.")
+
+    def scan_finished(self):
+        self.set_running(False)
+        if self.results:
+            self.current_changed(self.current.currentIndex())
+
+    def current_changed(self, index):
+        if self.running or index < 0:
+            return
+        self.geometry = self.window.slice_panel_geometry()
+        self.draw(self.results.get(self.current.itemData(index)))
+
+    def draw(self, view):
+        """The PAD slice of one V0 at the size of the main window's PAD Slice panel."""
+        if self.geometry is None:
+            self.geometry = self.window.slice_panel_geometry()
+        g = self.geometry; width, height = g['size']
+        self.canvas.setFixedSize(max(1, round(width * g['ppi'])), max(1, round(height * g['ppi'])))
+        fig = self.figure; fig.clear(); fig.set_size_inches(width, height, forward=False)
+        def rect(box):
+            return (box[0] / width, box[1] / height, box[2] / width, box[3] / height)
+        ax = fig.add_axes(rect(g['ax']))
+        if view is None:
+            direction = self.window.direction.currentText()
+            ax.text(.5, .5, 'Press Calc to calculate\nthe PAD slice for each V0', ha='center', va='center',
+                    transform=ax.transAxes)
+            ax.set(xticks=[], yticks=[], title=f"PAD Slice {direction}-EB")
+        else:
+            s = view['s']
+            marker = self.window.draw_slice(fig, ax, 'pad', view, cartesian_axis(s),
+                                            s['eb_min'] + s.get('ef_shift', 0.0))
+            marker.remove()  # the main window's current-EB marker
+            # fig.colorbar takes its room from the panel: put both back.
+            ax.set_position(rect(g['ax']))
+            for other in fig.axes:
+                if other is not ax: other.set_position(rect(g['colorbar']))
+            ax.set_title(f"PAD Slice {s['direction']}-EB, V0={view['v0']:g} eV"
+                         + ("" if view.get('complete') else " (calculating)"))
+        self.canvas.draw_idle()
 
 
 class PreferencesDialog(QtWidgets.QDialog):
