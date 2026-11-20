@@ -80,6 +80,9 @@ POLARIZATIONS = ("lx", "ly", "c+", "c-", "unpolarized")
 # with the band diagram and the PAD along the slice (2x2); "With Photoelectron
 # kz" adds the band weight panels and the kx-kz trajectories (3x2).
 DISPLAY_TYPES = (("Normal", "normal"), ("With Photoelectron kz", "photoelectron_kz"))
+# Colour scale of the PAD intensity ("Intensity display"): colour ∝ PAD^γ.
+# Display only; the colour bars keep PAD values.
+INTENSITY_SCALES = (("Linear", 1.0), ("sqrt(^0.5)", 0.5), ("^0.25", 0.25))
 
 # Slice directions offered in the GUI (results with a kz slice from earlier
 # versions are still drawn).
@@ -191,6 +194,29 @@ def save_session(settings, state):
     values = _read_initial_settings_raw()
     values[SESSION_KEY] = state
     core.json_write(INITIAL_SETTINGS_FILE, values)
+
+
+# Session entry with every sidebar value of the last Calc of each calculation
+# target: {target name: {"values": {...}, "saved": ISO time}}.  It is written
+# when Calc starts and is restored before anything else at the next start.
+CALC_SETTINGS_KEY = "calc_settings"
+
+
+def calc_snapshots(state):
+    """The per-target Calc values stored in a session state ({} when none)."""
+    snapshots = state.get(CALC_SETTINGS_KEY) if isinstance(state, dict) else None
+    return snapshots if isinstance(snapshots, dict) else {}
+
+
+def save_calc_snapshot(target, values):
+    """Store all sidebar values used by Calc for one target in the
+    initialization file (other session entries are kept)."""
+    raw = _read_initial_settings_raw()
+    state = raw.get(SESSION_KEY) if isinstance(raw.get(SESSION_KEY), dict) else {}
+    snapshots = calc_snapshots(state)
+    snapshots[target or ""] = {"values": values, "saved": datetime.now().isoformat(timespec="seconds")}
+    state[CALC_SETTINGS_KEY] = snapshots; raw[SESSION_KEY] = state
+    core.json_write(INITIAL_SETTINGS_FILE, raw)
 
 
 def set_data_folder(path):
@@ -2084,6 +2110,15 @@ class Window(QtWidgets.QMainWindow):
         self.calc=QtWidgets.QPushButton("Calc"); self.calc.clicked.connect(self.calculate)
         self.calc.setToolTip("Calculate or load the cache for the current target and parameters")
         side.addWidget(self.calc)
+        self.intensity=QtWidgets.QComboBox()
+        for label, gamma in INTENSITY_SCALES: self.intensity.addItem(label, gamma)
+        self.intensity.setToolTip("Colour scale of the PAD intensity (PAD maps, PAD slice and the PAD colours "
+                                  "of the band diagrams): Linear, PAD^0.5 or PAD^0.25.\n"
+                                  "Weak features become visible with ^0.5 and ^0.25. No recalculation.")
+        self.intensity.currentIndexChanged.connect(self.intensity_changed)
+        intensity_row=QtWidgets.QHBoxLayout(); intensity_row.setContentsMargins(0,0,0,0); intensity_row.setSpacing(4)
+        intensity_row.addWidget(QtWidgets.QLabel("Intensity display")); intensity_row.addWidget(self.intensity,1)
+        side.addLayout(intensity_row)
         self._slider_min=initial["eb_min"]; self._slider_step=initial["de"]
         self.slider=QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); self.slider.setRange(0,int(round((initial["eb_max"]-initial["eb_min"])/initial["de"]))); self.slider.valueChanged.connect(self.slider_changed)
         shift=initial["ef_shift"]
@@ -2645,7 +2680,10 @@ class Window(QtWidgets.QMainWindow):
             "parameter_tab": self.parameter_tabs.currentIndex(),
             "openmx_tab": self.openmx_tabs.currentIndex(),
             "display_type": self.display_type.currentData(),
+            "intensity_display": self.intensity.currentData(),
             "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            # Written at each Calc; kept as they are.
+            CALC_SETTINGS_KEY: calc_snapshots(read_session()),
         }
         try:
             save_session(settings, state)
@@ -2657,12 +2695,27 @@ class Window(QtWidgets.QMainWindow):
         state = self._session; self._preferred_structure = None
         name = self.current_structure.name if self.current_structure else None
         same_target = state.get("structure") == name
-        if same_target and state:
+        snapshot = calc_snapshots(state).get(name or "")
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("values"), dict):
+            # Every value of the last Calc of this target, saved when Calc
+            # was pressed, comes first: it wins over parameter.json and over
+            # values changed afterwards (or left over from an earlier exit).
+            self.restore_entered_values(snapshot["values"])
+        elif same_target and state:
             # Selecting the target applied its parameter.json; the values
-            # shown at exit take precedence, exactly as they were entered.
+            # shown at exit take precedence, exactly as they were entered,
+            # unless the settings were saved again later (a Calc before an
+            # exit that did not save the window state): valid exit values
+            # that differ from the saved settings are older than those.
             self.apply_settings(self.startup_settings)
-            if isinstance(state.get("values"), dict):
-                self.restore_entered_values(state["values"])
+            values = state.get("values")
+            if isinstance(values, dict):
+                try:
+                    stale = validate_settings(values) != self.startup_settings
+                except ValueError:
+                    stale = False  # an unusable combination is only kept in the session
+                if not stale:
+                    self.restore_entered_values(values)
         for tabs, key in ((self.parameter_tabs, "parameter_tab"), (self.openmx_tabs, "openmx_tab")):
             index = state.get(key)
             if isinstance(index, int) and 0 <= index < tabs.count() and tabs.isTabEnabled(index):
@@ -2671,6 +2724,10 @@ class Window(QtWidgets.QMainWindow):
         if display >= 0:
             self.display_type.blockSignals(True); self.display_type.setCurrentIndex(display)
             self.display_type.blockSignals(False)
+        intensity = self.intensity.findData(state.get("intensity_display"))
+        if intensity >= 0:
+            self.intensity.blockSignals(True); self.intensity.setCurrentIndex(intensity)
+            self.intensity.blockSignals(False)
         if isinstance(state.get("geometry"), str):
             self.restoreGeometry(QtCore.QByteArray.fromBase64(state["geometry"].encode("ascii")))
         if self.current_structure is None:
@@ -2924,6 +2981,9 @@ class Window(QtWidgets.QMainWindow):
         if not path: return
         try:
             write_settings(path, self.settings()); self.message.setText(f"Settings saved: {path}")
+            if self.persist_session and self.current_structure:
+                # Saved values are restored at the next start, as those of Calc.
+                save_calc_snapshot(self.current_structure.name, self.settings())
         except (OSError, ValueError) as exc:
             QtWidgets.QMessageBox.critical(self, "Settings save error", str(exc))
 
@@ -2931,10 +2991,16 @@ class Window(QtWidgets.QMainWindow):
         return self.current_structure / "parameter.json" if self.current_structure else INITIAL_SETTINGS_FILE
 
     def save_calc_settings(self, settings):
-        """Persist the latest Calc parameters for both startup and structure use."""
+        """Persist the latest Calc parameters for both startup and structure use.
+
+        All sidebar values are also stored for this target in the
+        initialization file; the next start restores them first."""
         write_settings(self.active_settings_path(), settings)
         if self.current_structure:
             write_settings(INITIAL_SETTINGS_FILE, settings)
+        if self.persist_session:
+            name = self.current_structure.name if self.current_structure else None
+            save_calc_snapshot(name, self.settings())
 
     def create_upload_job(self):
         if not self.current_structure:
@@ -3220,6 +3286,7 @@ class Window(QtWidgets.QMainWindow):
                                  f"for V0={lowest:g} eV.")
             plan = core.mesh_plan(settings)
             if not plan["reuse"] and not self.confirm_mesh_calculation(settings, plan): return False
+            self.save_calc_settings(settings)  # as Calc: restored first at the next start
         except core.CifError as exc:
             self.show_error(f"Cannot calculate {self.current_structure.name if self.current_structure else ''}: "
                             "its CIF has errors", exc); return False
@@ -3233,7 +3300,7 @@ class Window(QtWidgets.QMainWindow):
         self.worker = worker = V0ScanWorker(settings, self.current_structure, v0_values)
         worker.moveToThread(self.thread)
         self.thread.started.connect(worker.run)
-        worker.status.connect(self.message.setText); worker.status.connect(dialog.status.setText)
+        worker.status.connect(self.message.setText); worker.status.connect(dialog.show_status)
         worker.progress.connect(self.progress.setValue); worker.log.connect(self.append_log)
         worker.partial.connect(dialog.show_progress); worker.v0_done.connect(dialog.add_result)
         worker.done.connect(dialog.scan_done); worker.stopped.connect(dialog.scan_stopped)
@@ -3409,6 +3476,20 @@ class Window(QtWidgets.QMainWindow):
         self._eb_background=self.canvas.copy_from_bbox(fig.bbox)
         for artist in view['animated']: fig.draw_artist(artist)
 
+    def intensity_norm(self, vmin=None, vmax=None):
+        """Colour normalization of the PAD intensity chosen in Intensity
+        display: linear, or PAD^γ (PowerNorm); the colour bars keep PAD values."""
+        gamma = self.intensity.currentData() if hasattr(self, 'intensity') else 1.0
+        if gamma is None or gamma == 1.0:
+            return matplotlib.colors.Normalize(vmin, vmax)
+        return matplotlib.colors.PowerNorm(gamma, vmin, vmax)
+
+    def intensity_changed(self, *args):
+        """A new intensity scale is only drawn again: no Calc."""
+        self.redraw()
+        if self.v0_dialog is not None:
+            self.v0_dialog.redraw_current()
+
     def update_contour_lines(self, collection, segments, s, eb, data, axis):
         """Set the band contours of one EB, coloured by the PAD map of that EB."""
         pad=(self.eb_map_values(s,eb,data,'pad',axis) if data is not None
@@ -3424,7 +3505,8 @@ class Window(QtWidgets.QMainWindow):
         item=dict(ax=ax,name=name,artist=None,colorbar=None)
         if data is not None:
             values=self.eb_map_values(s,eb,data,name,axis)
-            im=ax.imshow(values,origin='lower',extent=extent,cmap=cmap,aspect='equal',vmin=0)
+            scale=dict(norm=self.intensity_norm(0)) if name=='pad' else dict(vmin=0)
+            im=ax.imshow(values,origin='lower',extent=extent,cmap=cmap,aspect='equal',**scale)
             item['artist']=im; item['colorbar']=panel_colorbar(fig,im,ax,label)
         else:
             ax.set_box_aspect(box)
@@ -3441,7 +3523,8 @@ class Window(QtWidgets.QMainWindow):
         item=dict(ax=ax,name='contours',artist=None,colorbar=None)
         segments=contour_segments(r.get('contours'),eb)
         if segments is not None:
-            collection=LineCollection(np.zeros((0,2,2)),cmap=PAD_BAND_CMAP,linewidths=1.0)
+            collection=LineCollection(np.zeros((0,2,2)),cmap=PAD_BAND_CMAP,linewidths=1.0,
+                                      norm=self.intensity_norm())
             self.update_contour_lines(collection,segments,s,eb,data,axis)
             ax.add_collection(collection)
             item['artist']=collection; item['colorbar']=panel_colorbar(fig,collection,ax,'PAD')
@@ -3470,18 +3553,19 @@ class Window(QtWidgets.QMainWindow):
         s=r['s']; shift=s.get('ef_shift',0.0); cuts=r['cuts']
         ebs=energies(s); display_ebs=np.asarray(ebs)+shift
         cmap,label,name={'band_weight':('viridis','Band weight','Band'),'pad':('inferno','PAD','PAD')}[key]
+        scale=dict(norm=self.intensity_norm(0)) if key=='pad' else dict(vmin=0)
         im=None; title=f"{name} Slice {s['direction']}-EB"
         if s['direction']=='kz':
             ordered=[cuts[e] for e in sorted(cuts)]
             if ordered:
                 k=np.concatenate([c['k'] for c in ordered]); val=np.concatenate([c[key] for c in ordered])
                 energy=np.array([c['eb']+shift for c in ordered]); valid=np.isfinite(val)
-                if valid.any(): im=ax.scatter(k[valid],energy[valid],c=val[valid],cmap=cmap,s=18,vmin=0)
+                if valid.any(): im=ax.scatter(k[valid],energy[valid],c=val[valid],cmap=cmap,s=18,**scale)
         else:
             values=np.full((len(ebs),len(axis)),np.nan)
             for i,e in enumerate(ebs):
                 if e in cuts: values[i]=cuts[e][key]
-            if np.isfinite(values).any(): im=ax.pcolormesh(axis,display_ebs,values,shading='auto',cmap=cmap,vmin=0)
+            if np.isfinite(values).any(): im=ax.pcolormesh(axis,display_ebs,values,shading='auto',cmap=cmap,**scale)
             ax.set_xlim(axis[0],axis[-1])
         if im is not None: panel_colorbar(fig,im,ax,label)
         else: ax.text(.5,.5,'No completed / visible points',ha='center',transform=ax.transAxes)
@@ -3506,7 +3590,7 @@ class Window(QtWidgets.QMainWindow):
         line=r.get('line') or {}
         if line.get('path')==PAD_SLICE_PATH:
             colored=pad_colored_bands(line,cuts,s)
-            band_norm=matplotlib.colors.Normalize(*pad_band_limits(colored['range']))
+            band_norm=self.intensity_norm(*pad_band_limits(colored['range']))
             def band_colors(values):
                 return PAD_BAND_CMAP(band_norm(np.ma.masked_invalid(values)))
             segments=colored['segments'].copy(); segments[...,1]+=shift
@@ -3821,14 +3905,18 @@ class V0ScanDialog(QtWidgets.QDialog):
 
     Calculates the PAD slice (kx-EB or ky-EB, from Slice direction) for V0
     from V0 Begin to V0 End every V0 Step, with all other parameters taken
-    from the sidebar.  The slice being calculated is shown as it fills; once
-    finished, Current V0 shows each V0.  The graph is drawn at exactly the
-    size of the PAD Slice panel of the main window.
+    from the sidebar, after a Yes to "This calculation takes time. Start it
+    now?".  The slice being calculated is shown as it fills; results already
+    on screen stay instead until the new calculation has finished.  Current
+    V0 then shows each V0.  The graph is drawn at exactly the size of the PAD
+    Slice panel of the main window.
     """
 
     def __init__(self, window):
         super().__init__(window)
         self.window = window; self.results = {}; self.v0_values = []; self.running = False; self.geometry = None
+        self.pending = None; self.keep_previous = False  # results of a running calculation
+        self.shown = None  # the slice on the graph
         self.setWindowTitle("Calc with changing V0")
         self.begin = window.spin(10.0, 0.001, 1000)
         self.end = window.spin(12.0, 0.001, 1000)
@@ -3861,7 +3949,26 @@ class V0ScanDialog(QtWidgets.QDialog):
         self.calc_button.setText("Stop" if running else "Calc")
         for box in (self.begin, self.end, self.step):
             box.setEnabled(not running)
-        self.current.setEnabled(not running and self.current.count() > 0)
+        # While a new calculation runs, the previous results stay browsable.
+        self.current.setEnabled(self.current.count() > 0 and (not running or self.keep_previous))
+
+    def confirm_start(self, values):
+        """Ask before the (long) calculation; Yes starts it."""
+        count = len(values)
+        what = (f"1 V0 value ({values[0]:g} eV)." if count == 1 else
+                f"{count} V0 values from {values[0]:g} to {values[-1]:g} eV every {self.step.value():g} eV.")
+        cost = ("It is a complete PAD calculation, as long as Calc in the main window." if count == 1 else
+                f"Each V0 is a complete PAD calculation, as long as Calc in the main window, "
+                f"so this takes about {count} times as long.")
+        keep = ("\nThe results shown now stay until the new calculation finishes." if self.results else "")
+        box = QtWidgets.QMessageBox(self); box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        box.setWindowTitle("Start calculation?")
+        box.setText("This calculation takes time. Start it now?")
+        box.setInformativeText(f"{what}\n{cost}{keep}\n\nYes: start the calculation.\nNo: do not calculate.")
+        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Yes)
+        box.setEscapeButton(QtWidgets.QMessageBox.StandardButton.No)
+        return box.exec() == QtWidgets.QMessageBox.StandardButton.Yes
 
     def calc_clicked(self):
         if self.running:
@@ -3872,49 +3979,83 @@ class V0ScanDialog(QtWidgets.QDialog):
             values = v0_scan_values(self.begin.value(), self.end.value(), self.step.value())
         except ValueError as exc:
             self.status.setText(f"⚠ {exc}"); return
-        self.results = {}; self.v0_values = values
-        self.current.blockSignals(True); self.current.clear(); self.current.blockSignals(False)
-        self.geometry = self.window.slice_panel_geometry()
-        self.status.setText(f"Calculating {len(values)} V0 values: {values[0]:g} to {values[-1]:g} eV")
-        if self.window.start_v0_scan(self, values):
-            self.set_running(True)
-        else:
-            self.set_running(False)
+        if not self.confirm_start(values):
+            self.status.setText("Not started."); return
+        # New results are collected apart; with results on screen, those stay
+        # (graph and Current V0) until the new calculation has finished.
+        self.v0_values = values; self.pending = {}; self.keep_previous = bool(self.results)
+        if not self.keep_previous:
+            self.geometry = self.window.slice_panel_geometry()
+        self.show_status(f"Calculating {len(values)} V0 values: {values[0]:g} to {values[-1]:g} eV")
+        started = self.window.start_v0_scan(self, values)
+        if not started: self.keep_previous = False
+        self.set_running(started)
+
+    def show_status(self, text):
+        if self.keep_previous:  # a calculation started with results on screen
+            text += "\nThe previous results are shown until this calculation finishes."
+        self.status.setText(text)
 
     def show_progress(self, view):
-        """Slice of the V0 being calculated (partly filled)."""
-        self.draw(view)
+        """Slice of the V0 being calculated (partly filled), unless the
+        previous results stay on screen."""
+        if not self.keep_previous:
+            self.draw(view)
 
     def add_result(self, view):
-        v0 = view['v0']; self.results[v0] = view
+        v0 = view['v0']; self.pending[v0] = view
+        if self.keep_previous:
+            return
+        self.results = self.pending
         self.current.blockSignals(True)
         self.current.addItem(f"{v0:g}", v0); self.current.setCurrentIndex(self.current.count() - 1)
         self.current.blockSignals(False)
         self.draw(view)
 
+    def show_results(self, results):
+        """Replace the results in Current V0 (the last V0 is selected)."""
+        self.results = dict(results)
+        self.current.blockSignals(True); self.current.clear()
+        for v0 in sorted(self.results):
+            self.current.addItem(f"{v0:g}", v0)
+        self.current.setCurrentIndex(self.current.count() - 1)
+        self.current.blockSignals(False)
+
     def scan_done(self):
+        if self.keep_previous:
+            self.show_results(self.pending)
+        self.keep_previous = False
         self.status.setText(f"Complete: {len(self.results)} V0 values. Choose Current V0 to show each.")
 
     def scan_stopped(self):
         self.window.progress.setFormat("Stopped")
-        self.status.setText(f"Stopped: {len(self.results)} of {len(self.v0_values)} V0 values calculated.")
+        text = f"Stopped: {len(self.pending)} of {len(self.v0_values)} V0 values calculated."
+        if self.keep_previous: text += " The previous results are still shown."
+        self.status.setText(text)
 
     def scan_failed(self, text):
-        self.status.setText("Calculation failed; see the message and the log.")
+        self.status.setText("Calculation failed; see the message and the log."
+                            + (" The previous results are still shown." if self.keep_previous else ""))
 
     def scan_finished(self):
+        self.keep_previous = False; self.pending = None
         self.set_running(False)
         if self.results:
             self.current_changed(self.current.currentIndex())
 
     def current_changed(self, index):
-        if self.running or index < 0:
+        if index < 0 or (self.running and not self.keep_previous):
             return
         self.geometry = self.window.slice_panel_geometry()
         self.draw(self.results.get(self.current.itemData(index)))
 
+    def redraw_current(self):
+        """Draw the shown slice again (e.g. another Intensity display)."""
+        self.draw(self.shown)
+
     def draw(self, view):
         """The PAD slice of one V0 at the size of the main window's PAD Slice panel."""
+        self.shown = view
         if self.geometry is None:
             self.geometry = self.window.slice_panel_geometry()
         g = self.geometry; width, height = g['size']
