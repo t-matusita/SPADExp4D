@@ -2,7 +2,7 @@
 
 [English](README_EN.md) | 日本語
 
-現在のバージョン：**1.2.0**
+現在のバージョン：**1.3.0**
 
 SPADExp4Dは、第一原理計算コードOpenMXの出力を利用して、角度分解光電子分光（ARPES）の光電子角度分布（PAD）を4次元空間 `(kx, ky, kz, E)` で計算・可視化する研究用ソフトウェアです。
 
@@ -189,11 +189,13 @@ structures/<structure_name>/
 - `scf.SpinPolarization on`では上下スピンのPADを合計し、`NC`ではスピノルの両成分を合計します。常磁性でスピン軌道相互作用を入れる場合は`NC`と`scf.SpinOrbit.Coupling`を使います。
 - `Stored bands E−EF`でk-space HDF5に保存するバンドのエネルギー範囲を指定できます（`All`は全バンド）。NCではバンド数と係数が増えるため、PADを計算するEB範囲を含む窓を指定するとHDF5とメモリを数分の一にできます。窓の外の状態はPADに含まれません。
 
-計算前に確認ダイアログが表示されます。計算を開始するには`Yes`を選択してください。OpenMXの実行中はログと進捗が画面に表示され、必要に応じて`Cancel`で停止できます。
+OpenMXで計算する前に「Calculate the eigenstates of <計算対象> with OpenMX now?」という確認が表示されます。k点の分割数と総数、中断した計算から保存済みのk点数（あれば）と、これから計算するk点数が示されます。計算を開始するには`Yes`、分割数を見直すなど今は計算しない場合は`No`を選択してください。OpenMXの実行中はログと進捗が画面に表示され、必要に応じて`Cancel`で停止できます。
+
+`Results`タブの`K-space HDF5`には、PADに使ったk-space HDF5ファイル、計算日時、OpenMXとHDF5変換の時間（合計と実時間）、ファイルサイズが表示されます。フルパスはツールチップに表示されます。計算時間はk-space HDF5ファイル自体（属性`CalculationTiming`）に保存されるため、キャッシュを再利用したとき、再起動後、保存したPAD結果を開いたときにも表示されます。中断して再開した計算では、中断前の時間も合計されます。このバージョンより前に作ったキャッシュには計算時間が記録されていないため、計算日時とサイズだけが表示されます。
 
 ### 3. PAD条件（`PAD`タブ）
 
-`K-space HDF5`より下の設定は、`PAD`タブと`Band Diagram`タブに分かれています。`PAD`タブには次の順に並んでいます。
+OpenMXのタブより下の設定は、`PAD`タブと`Band Diagram`タブに分かれています。`PAD`タブには次の順に並んでいます。
 
 - `PAD calculation`：`C++ batch`または比較用の`Python per EB (comparison)`
 - `hν`：光子エネルギー
@@ -202,7 +204,8 @@ structures/<structure_name>/
 - `EF shift`：表示時のFermi準位シフト
 - `V0`：物質内部ポテンシャル。`V0 <= 0`では自動設定を使用します
 - `wfnc`：光電子波動関数のパラメーター
-- `Slice direction`：PADとバンドのスライス方向（`kx`、`ky`、`kz`）
+- `Slice direction`：PADとバンドのスライス方向（`kx`または`ky`）
+- `ky fixed`（`ky`スライスでは`kx fixed`）：スライスの位置を決める固定座標（4.を参照）
 - `KMin, KMax, Kstep`：表示する運動量範囲と刻み
 - `EB Begin, End, Step`：結合エネルギーの範囲と刻み
 - `Gaussian dK`、`Gaussian dE`：保存済みPADに運動量方向・エネルギー方向のGaussian平滑化を適用します。変更してもOpenMXやPADの再計算は不要です
@@ -211,11 +214,20 @@ structures/<structure_name>/
 
 PAD計算条件を変更しても、第一BZの固有状態キャッシュは再利用されます。
 
-### 4. バンド図の断面（`Band Diagram`タブ）
+### 4. スライスの座標と図（`Band Diagram`タブ）
 
-`Slice direction`で選んだスライスの固定座標を指定します。`kx`スライスでは`ky fixed`でkyを指定します。kzは固定ではなく、各EBで光電子の球面 kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²) に従うため、`kz fixed`は入力できません（`ky`スライスも同様）。`kz`スライスでは、`kx fixed`と`ky fixed`で軌跡が通る点を指定します。
+`Band Diagram`タブはバンド図の設定用で、まだ実装していないため、このバージョンでは選択できません（無効）。このタブにあるのは2つ目の固定座標だけで、`parameter.json`（または開いた結果ファイル）に保存された値のままになります。1つ目の固定座標は`PAD`タブの`Slice direction`の下で入力します。`Slice direction`で選んだスライスの固定座標は次のとおりです。`kx`スライスでは`ky fixed`（`PAD`タブ）でkyを指定します。kzは固定ではなく、各EBで光電子の球面 kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²) に従うため、`kz fixed`は使いません（`ky`スライスも同様で、`kx fixed`を指定します）。`Slice direction`で選べるのは`kx`と`ky`だけです。以前のバージョンで保存した`kz`スライスの設定は`kx`として開き、`kz`スライスの結果ファイルはそのまま表示できます。
 
-図には、`Band Slice EB′`と`PAD: EB′`（選択したEBでのkx–kyマップ）、`Band Slice kx-EB`と`PAD Slice kx-EB`（スライスのEB依存性）、`Band Diagram (PAD cut)`、kx–kz光電子軌跡が表示されます。`Band Diagram (PAD cut)`はkzを固定したバンド図ではありません。PADのスライスが実際に通るk点、つまり EB = −E_n(kx, ky, kz(EB)) となる点のバンドを描くので、`PAD Slice kx-EB`とそのまま比較できます。
+図の並びは、`Calc`の上の`Display type`で選びます（計算し直す必要はありません）。
+
+| Display type | 図 |
+|---|---|
+| `Normal`（既定） | 2×2：左上`Band Diagram EB′`（選択したEBでのバンドの断面）、右上`PAD: EB′`、左下`Band Diagram (PAD cut)`、右下`PAD Slice kx-EB` |
+| `With Photoelectron kz` | 3×2：`Band Slice EB′`と`PAD: EB′`（選択したEBでのkx–kyマップ）、`Band Slice kx-EB`と`PAD Slice kx-EB`（スライスのEB依存性）、`Band Diagram (PAD cut)`、kx–kz光電子軌跡 |
+
+`Band Diagram EB′`は、選択したEBでPADのマップが通る光電子の球面上（kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²)）で、EB = −E_n(kx, ky, kz) となるバンドの断面を線で描きます。線の色は、その位置のPAD（`PAD: EB′`と同じGaussian dK/dE適用後の値）を表し、範囲はそのEBで表示されているPADの最小値から最大値までです（レインボー、カラーバー`PAD`）。PADがない部分（光電子の脱出限界やθmaxの外側）の線は灰色です。断面線は計算のたびに全EBについて求めて結果に保存します。断面線を含まない以前の結果は、k-space HDF5があれば表示するときに求めます。
+
+どちらの表示でも、`Band Diagram (PAD cut)`はkzを固定したバンド図ではありません。PADのスライスが実際に通るk点、つまり EB = −E_n(kx, ky, kz(EB)) となる点のバンドを描くので、`PAD Slice kx-EB`とそのまま比較できます。各バンドは、スライス上のその位置のPAD（Gaussian dK/dE適用後）でレインボーカラーに色分けされます。色の範囲は、表示範囲内のスライスのPADの最小値から最大値までです（カラーバー`PAD`）。スライスにPADがない部分（光電子の脱出限界やθmaxの外側）のバンドは灰色です。すべての図は上段のkx–kyマップと同じ幅・同じ横位置で並ぶので、各列のk軸がそろいます。
 
 ### 5. 結果の再利用と保存
 
@@ -225,7 +237,7 @@ PAD計算条件を変更しても、第一BZの固有状態キャッシュは再
 
 #### 前回の状態の復帰
 
-終了時に、計算対象、左側のすべてのパラメーター、選択中のタブ、EBの位置、ウィンドウの大きさを`python/spadexp_4d.ini.json`に保存します。また、計算が完了するたびに、その結果を`<計算対象>/cache/last_pad_result.h5`へ保存します。次回の起動時には同じ計算対象が選ばれ、前回のPAD結果が再計算なしで表示されます。計算後に変更したGaussian dK/dE、EF shift、θmax、Boundaryもそのまま戻ります。終了時にPAD結果ファイルを開いていた場合は、そのファイルを表示します。
+終了時に、計算対象、左側のすべてのパラメーター、選択中のタブ、`Display type`、EBの位置、ウィンドウの大きさを`python/spadexp_4d.ini.json`に保存します。また、計算が完了するたびに、その結果を`<計算対象>/cache/last_pad_result.h5`へ保存します。次回の起動時には同じ計算対象が選ばれ、前回のPAD結果が再計算なしで表示されます。計算後に変更したGaussian dK/dE、EF shift、θmax、Boundaryもそのまま戻ります。左側のパラメーターは、終了時に表示していた値がそのまま戻ります。組み合わせが条件を満たさない場合（例：EB End − EB BeginがEB Stepで割り切れない）も入力した値のまま戻り、`Calc`の上に赤字で理由が表示されます（直すまで`Calc`はできません。`parameter.json`には最後の有効な値が残ります）。計算対象を切り替えたときは、その対象に保存したパラメーターが使われます。`Calculation result`で計算結果を選んだときだけ、その計算の条件が読み込まれます。終了時にPAD結果ファイルを開いていた場合は、そのファイルを表示します。
 
 #### PAD結果の保存と読み込み（HDF5）
 
@@ -238,7 +250,8 @@ PAD計算条件を変更しても、第一BZの固有状態キャッシュは再
 | `PAD` | `binding_energy`（eV）、`k`（Å⁻¹、kxとky共通）、平滑化前の`pad`と`band_weight`（EB, ky, kx、gzip圧縮）、`nearest_eigenstate_distance`。属性`v0_eV`、`request_json` |
 | `BandCut` | PADスライスに沿ったバンド：線は`k`と`energy`（E − EF、eV。スライス外はNaN）、同じkで複数回交わる点と`kz`スライスは`points`（k、E − EF） |
 | `Structure` | `cif`、`openmx_template`（`.openmx.base.dat`）、`lattice`（Å）、`reciprocal`（Å⁻¹） |
-| `Calculation` | k-space HDF5のパスとサイズ、OpenMX・変換・PADの計算時間、固有状態までの最大距離 |
+| `BandContours` | 各EBのバンドの断面線（`Band Diagram EB′`）：`binding_energy`、`offsets`（EB iの線分は`offsets[i]:offsets[i+1]`）、`segments`（線分の両端のkx, ky、Å⁻¹） |
+| `Calculation` | k-space HDF5のパスとサイズ、OpenMX・変換・PADの計算時間、k-space HDF5の計算記録（`mesh_timing`、JSON）、固有状態までの最大距離 |
 
 Gaussian dK/dEは設定として保存し、表示するときに適用します。そのため、保存されるPADは平滑化前の値です。k-space HDF5（固有状態）は含まれません。条件を変えて再び`Calc`を押す場合は、k-space HDF5が必要です（ない場合は再計算します）。
 
@@ -250,7 +263,7 @@ Gaussian dK/dEは設定として保存し、表示するときに適用します
 - バイナリと実行時HDF5は配布されません。
 - OpenMXおよびそのデータファイルは別途必要です。
 - 大きな3次元k点グリッドは計算時間とHDF5容量が急増します。
-- 自動CIF変換は部分占有・無秩序サイト・未定義元素に対応しません。
+- 自動CIF変換は部分占有・無秩序サイト・未定義元素に対応しません。使えないCIFの場合、`Import CIF`は問題点を一つずつ英語で説明し、構造を追加しません。対象は、セルの値の不足や誤り、原子の一覧や分率座標がないこと、元素ではない記号（構造のひな形の`T`や`X1`のような仮の記号など）、部分占有のサイト、同じ位置に重なった原子、OpenMXに基底関数がない元素です。cif2omxのメッセージは「Show Details」で見られます。
 - `scf.SpinPolarization on`の初期スピン配置はCIFから生成した値（上下同数）のままです。磁気秩序を扱うには`.openmx.base.dat`の初期スピンや磁気単位胞を用意してください。
 
 ## 引用

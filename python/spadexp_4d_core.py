@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime
 import fcntl
 import hashlib
 import itertools
@@ -9,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import shutil
 import subprocess
@@ -81,6 +83,176 @@ def normalized_cif_text(path):
     charged_element = re.compile(
         r'(?<![A-Za-z])([A-Z][a-z]?)(?:(?:\d+(?:\.\d+)?)[+-]|[+-](?:\d+(?:\.\d+)?)?)(?![A-Za-z0-9])')
     return charged_element.sub(r'\1', source)
+
+
+ELEMENT_SYMBOLS = frozenset("""
+    H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br
+    Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho
+    Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es
+    Fm Md No Lr""".split())
+
+
+def cif_atom_sites(text):
+    """Rows of the CIF ``_atom_site_*`` loop as dicts keyed by tag (lower case)."""
+    lines = text.splitlines(); sites = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip().lower() != 'loop_':
+            i += 1; continue
+        i += 1; tags = []
+        while i < len(lines) and lines[i].strip().startswith('_'):
+            tags.append(lines[i].split()[0].lower()); i += 1
+        if not any(tag in ('_atom_site_label', '_atom_site_type_symbol') for tag in tags):
+            continue
+        values = []
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith('#'):
+                if values: break
+                i += 1; continue
+            if stripped.lower() == 'loop_' or stripped.startswith('_') or stripped.lower().startswith('data_'):
+                break
+            try:
+                values.extend(shlex.split(stripped))
+            except ValueError:
+                values.extend(stripped.split())
+            i += 1
+        for start in range(0, len(values) - len(tags) + 1, len(tags)):
+            sites.append(dict(zip(tags, values[start:start + len(tags)])))
+    return sites
+
+
+CELL_TAGS = ('_cell_length_a', '_cell_length_b', '_cell_length_c',
+             '_cell_angle_alpha', '_cell_angle_beta', '_cell_angle_gamma')
+CIF_FIX_ADVICE = ('Correct the CIF in a text editor (or export it again, for example from VESTA) '
+                  'and import it again.')
+
+
+class CifError(ValueError):
+    """A CIF that cannot be used, with every problem explained in plain English.
+
+    ``problems`` holds one sentence per problem (what is wrong and how to fix
+    it); ``details`` holds technical output such as the cif2omx messages.
+    """
+    def __init__(self, path, problems, details='', advice=CIF_FIX_ADVICE):
+        self.path = Path(path); self.problems = list(problems); self.details = details
+        self.advice = advice
+        super().__init__(self.message())
+
+    def message(self):
+        return '\n'.join([f'The CIF file "{self.path.name}" cannot be used:']
+                         + [f'• {problem}' for problem in self.problems] + [self.advice])
+
+
+def cif_number(value):
+    """A CIF number such as 4.196(2); None when it is not a number."""
+    try:
+        return float(re.sub(r'\([^)]*\)', '', str(value)))
+    except ValueError:
+        return None
+
+
+def cif_cell_values(text):
+    """Cell lengths and angles of a CIF, and the problems found with them."""
+    values, problems = {}, []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].lower() in CELL_TAGS:
+            values[fields[0].lower()] = fields[1]
+    missing = [tag for tag in CELL_TAGS if tag not in values]
+    if missing:
+        problems.append('The unit cell is incomplete: ' + ', '.join(missing) + ' '
+                        + ('is' if len(missing) == 1 else 'are') + ' missing. A CIF needs all six '
+                        '_cell_length_a/b/c (Å) and _cell_angle_alpha/beta/gamma (degrees).')
+    cell = {}
+    for tag in CELL_TAGS:
+        if tag not in values:
+            continue
+        number = cif_number(values[tag])
+        if number is None:
+            problems.append(f'{tag} is "{values[tag]}", which is not a number.')
+        elif tag.startswith('_cell_length') and number <= 0:
+            problems.append(f'{tag} is {values[tag]}; a cell length must be larger than 0 Å.')
+        elif tag.startswith('_cell_angle') and not 0 < number < 180:
+            problems.append(f'{tag} is {values[tag]}; a cell angle must be between 0 and 180 degrees.')
+        else:
+            cell[tag] = number
+    return cell, problems
+
+
+def cif_problems(path):
+    """Everything in a CIF that the automatic OpenMX conversion cannot use.
+
+    Returns plain-English sentences (what is wrong and how to fix it): an
+    incomplete or invalid unit cell, no atom-site list or no fractional
+    coordinates, type symbols that are not chemical elements (after removing
+    oxidation states such as Ta4+), partly occupied sites and several atoms at
+    one position.  An empty list means the CIF looks usable.
+    """
+    try:
+        text = normalized_cif_text(path)
+    except OSError as exc:
+        return [f'The file could not be read ({exc.strerror or exc}).']
+    if not text.strip():
+        return ['The file is empty.']
+    _, problems = cif_cell_values(text)
+    sites = cif_atom_sites(text)
+    if not sites:
+        problems.append('No atoms were found. A CIF needs a loop_ that lists _atom_site_label, '
+                        '_atom_site_type_symbol and the fractional coordinates _atom_site_fract_x, '
+                        '_atom_site_fract_y and _atom_site_fract_z, one line per atom.')
+        return problems
+    axes = ('_atom_site_fract_x', '_atom_site_fract_y', '_atom_site_fract_z')
+    missing = [tag for tag in axes if tag not in sites[0]]
+    if missing:
+        problems.append('The atom list has no ' + ', '.join(missing) + '. Atom positions must be given as '
+                        'fractional coordinates (_atom_site_fract_x, _atom_site_fract_y, _atom_site_fract_z).')
+    unknown, partial, positions = [], [], {}
+    for site in sites:
+        label = site.get('_atom_site_label', '?')
+        symbol = site.get('_atom_site_type_symbol') or re.match(r'[A-Za-z]*', label).group(0)
+        if symbol not in ELEMENT_SYMBOLS:
+            hint = symbol[:1].upper() + symbol[1:].lower()
+            unknown.append(f'"{symbol}" (write "{hint}")' if hint in ELEMENT_SYMBOLS
+                           else f'"{symbol}"' + ('' if symbol == label else f' at site {label}'))
+        occupancy = cif_number(site.get('_atom_site_occupancy', '1'))
+        if occupancy is not None and occupancy < 0.999:
+            partial.append(f'{label} ({occupancy:g})')
+        if not missing:
+            xyz = [cif_number(site[tag]) for tag in axes]
+            if any(value is None for value in xyz):
+                problems.append(f'Atom {label} has a coordinate that is not a number: '
+                                + ', '.join(f'{tag} = "{site[tag]}"' for tag, value in zip(axes, xyz)
+                                            if value is None) + '.')
+            else:
+                key = tuple(round(value % 1.0, 4) % 1.0 for value in xyz)
+                positions.setdefault(key, []).append(label)
+    if unknown:
+        problems.append('These _atom_site_type_symbol values are not chemical elements: ' + ', '.join(unknown)
+                        + '. Each atom needs a real element symbol such as Fe, O or Si; placeholders '
+                        'such as T, M or X from a structure template must be replaced.')
+    if partial:
+        problems.append('These sites are only partly occupied (_atom_site_occupancy): ' + ', '.join(partial)
+                        + '. Mixed or partly occupied sites are not supported; keep one fully occupied '
+                        'atom per site.')
+    for position, labels in positions.items():
+        if len(labels) > 1:
+            problems.append(f'Atoms {", ".join(labels)} are at the same position '
+                            f'({", ".join(f"{value:g}" for value in position)}). Keep only one atom there.')
+    return problems
+
+
+def undefined_template_species(path):
+    """Species of an OpenMX template without a PAO/VPS (cif2omx writes 'undefined')."""
+    try:
+        text = Path(path).read_text(errors='replace')
+    except OSError:
+        return []
+    match = re.search(r'<Definition\.of\.Atomic\.Species(.*?)Definition\.of\.Atomic\.Species>', text, flags=re.S)
+    if match is None:
+        return []
+    return [line.split()[0] for line in match.group(1).splitlines()
+            if line.split() and re.search(r'\bundefined\b', line, flags=re.I)]
 
 
 def template_has_undefined_species(path):
@@ -162,7 +334,8 @@ def _cif_cell(path):
     required = ('_cell_length_a', '_cell_length_b', '_cell_length_c',
                 '_cell_angle_alpha', '_cell_angle_beta', '_cell_angle_gamma')
     if any(key not in values for key in required):
-        raise ValueError(f'Could not read lattice parameters from CIF: {path}')
+        raise CifError(path, cif_cell_values(Path(path).read_text(errors='replace'))[1]
+                       or ['The unit cell could not be read.'])
     a, b, c = (values[f'_cell_length_{x}'] for x in 'abc')
     alpha, beta, gamma = (np.deg2rad(values[f'_cell_angle_{x}']) for x in ('alpha', 'beta', 'gamma'))
     avec = np.array((a, 0.0, 0.0))
@@ -192,6 +365,9 @@ def configure_structure(structure_path=None):
     template = folder / '.openmx.base.dat'
     if ((not template.is_file()) or template.stat().st_mtime_ns < cif.stat().st_mtime_ns
             or template_has_undefined_species(template)):
+        problems = cif_problems(cif)
+        if problems:
+            raise CifError(cif, problems)
         if not CONVERTER.is_file():
             raise FileNotFoundError(
                 'cif2omx not found. Add it to PATH or specify the executable '
@@ -203,11 +379,22 @@ def configure_structure(structure_path=None):
                                        cwd=folder, capture_output=True, text=True)
         finally:
             normalized.unlink(missing_ok=True)
+        output = (completed.stdout + completed.stderr).strip()[-4000:]
         if completed.returncode != 0 or not template.is_file():
-            raise RuntimeError('Could not generate OpenMX input from CIF: ' + completed.stderr[-2000:])
+            raise CifError(cif, ['cif2omx could not turn the CIF into an OpenMX input. '
+                                 'Its messages are shown in the details.'], output)
         if template_has_undefined_species(template):
-            raise RuntimeError('Could not determine OpenMX PAO/VPS from CIF element symbols. '
-                               'Check _atom_site_type_symbol.')
+            species = undefined_template_species(template)
+            template.unlink(missing_ok=True)
+            names = ', '.join(f'"{name}"' for name in species) or 'some atoms'
+            if species and all(name in ELEMENT_SYMBOLS for name in species):
+                # Real elements that the OpenMX library does not cover.
+                raise CifError(cif, [f'OpenMX has no basis set (PAO/VPS in DFT_DATA19) for {names}, '
+                                     'so this structure cannot be calculated.'], output,
+                               advice='Use a structure without these elements, or add PAO/VPS files '
+                                      'for them to DFT_DATA19.')
+            raise CifError(cif, [f'OpenMX has no basis set (PAO/VPS in DFT_DATA19) for {names}. '
+                                 'Check that _atom_site_type_symbol names the element of every atom.'], output)
     TEMPLATE = template
     RESTART_NAME = folder.name + '_scf'
     RESTART = STRUCTURE_CACHE / 'scf_rst'
@@ -747,12 +934,64 @@ def cache_ok(path, request):
         return False
 
 
+MESH_TIMING_ATTR = 'CalculationTiming'
+
+
+def mesh_timing(path):
+    """Calculation record stored in a k-space HDF5 file, or None.
+
+    Returns a dict with ``openmx_seconds``, ``conversion_seconds``,
+    ``wall_seconds`` and ``completed_at`` (local time) for caches written by
+    ensure_mesh(); older caches only give ``created`` from the converter's
+    Datetime attribute.  Reading never modifies the file (its stamp keys the
+    PAD caches).
+    """
+    def text(value):
+        return value.decode() if isinstance(value, bytes) else str(value)
+    try:
+        with h5py.File(path, 'r') as f:
+            stored = f.attrs.get(MESH_TIMING_ATTR); created = f.attrs.get('Datetime')
+    except (OSError, ValueError):
+        return None
+    record = {}
+    if stored is not None:
+        try:
+            value = json.loads(text(stored))
+        except ValueError:
+            value = None
+        if isinstance(value, dict):
+            record.update(value)
+    if created is not None:
+        record.setdefault('created', text(created))
+    return record or None
+
+
 def mesh_plan(settings):
     request = mesh_request(settings)
     folder = CACHE / ('mesh_' + request_code(request))
     path = folder / 'eigenstates.hdf5'
     return {'request': request, 'folder': folder, 'path': path, 'reuse': cache_ok(path, request),
             'count': int(np.prod(request['divisions']))}
+
+
+def saved_mesh_points(plan):
+    """k points of a planned mesh already saved by an interrupted calculation.
+
+    Counts the committed batches of the partial HDF5 of the same request (the
+    ones ensure_mesh() keeps); 0 when there is none.  Never modifies files.
+    """
+    if plan.get('reuse'):
+        return plan['count']
+    count = plan['count']; batches = (count + CHUNK_POINTS - 1) // CHUNK_POINTS
+    try:
+        with h5py.File(plan['folder'] / 'eigenstates.partial.hdf5', 'r') as f:
+            if (f.attrs.get('Request') != json.dumps(plan['request'], sort_keys=True)
+                    or f['Mesh/CompletedChunks'].shape != (batches,)):
+                return 0
+            done = np.flatnonzero(f['Mesh/CompletedChunks'][:])
+    except (OSError, KeyError, ValueError):
+        return 0
+    return int(sum(min(CHUNK_POINTS, count - i * CHUNK_POINTS) for i in done))
 
 
 def completed_openmx(folder, stem, text):
@@ -999,6 +1238,7 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
     window = band_window(settings)
     folder.mkdir(parents=True, exist_ok=True)
     with file_lock(folder / 'mesh.lock'):
+        run_started = time.monotonic()
         if cache_ok(final, request):
             if log: log(f'[OpenMX skipped] Reusing first-BZ data for {plan["count"]:,} points: {final}')
             return final, 0.0
@@ -1023,6 +1263,22 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                 mesh.create_dataset('CompletedChunks', data=np.zeros(batches, dtype=bool))
         elapsed = 0.0
         with h5py.File(partial, 'r+') as f:
+            def add_timing(openmx_seconds=0.0, conversion_seconds=0.0, wall_seconds=0.0, **extra):
+                # Kept in the partial file, so a resumed calculation adds to the
+                # time already spent, and renamed with it into the final cache.
+                try:
+                    record = json.loads(f.attrs.get(MESH_TIMING_ATTR, '{}'))
+                except (TypeError, ValueError):
+                    record = {}
+                for key, value in (('openmx_seconds', openmx_seconds),
+                                   ('conversion_seconds', conversion_seconds),
+                                   ('wall_seconds', wall_seconds)):
+                    record[key] = float(record.get(key, 0.0)) + float(value)
+                record.update(extra)
+                f.attrs[MESH_TIMING_ATTR] = json.dumps(record, sort_keys=True); f.flush()
+                if timing and (openmx_seconds or conversion_seconds):
+                    timing(openmx_seconds, conversion_seconds)
+
             def store_raw(raw_path, selected, points):
                 # Write bounded slabs, but commit completion only after ALL slabs
                 # are durable. A stopped import retries the same OpenMX job/output.
@@ -1077,8 +1333,7 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                     import_started = time.monotonic()
                     store_raw(raw_path, np.array([batch]), points)
                     conversion_seconds += time.monotonic() - import_started
-                    if timing:
-                        timing(seconds, conversion_seconds)
+                    add_timing(seconds, conversion_seconds)
             pending = np.flatnonzero(~f['Mesh/CompletedChunks'][:])
             if len(pending):
                 pieces = []
@@ -1103,8 +1358,9 @@ def ensure_mesh(settings, log=None, progress=None, stop=None, conversion=None, t
                 import_started = time.monotonic()
                 store_raw(raw_path, pending, points)
                 conversion_seconds += time.monotonic() - import_started
-                if timing:
-                    timing(seconds, conversion_seconds)
+                add_timing(seconds, conversion_seconds)
+            add_timing(wall_seconds=time.monotonic() - run_started, k_points=int(count),
+                       completed_at=datetime.now().astimezone().isoformat(timespec='seconds'))
             f.attrs['Complete'] = True; f.flush()
         if not cache_ok(partial, request):
             raise RuntimeError('First-BZ cache validation failed.')
@@ -1192,6 +1448,31 @@ class EigenstateGrid:
     def bands(self, cartesian):
         indices, error = self.lookup(cartesian)
         return (self.band_values(indices) - self.ef) * 27.211386245988, error
+
+    def band_table(self):
+        """All stored eigenvalues in eV relative to EF (k points × bands), read once."""
+        if getattr(self, '_band_table', None) is None:
+            values = np.concatenate([self.file[path][()] for path in self.band_paths], axis=1)
+            self._band_table = (values - self.ef) * EH_EV
+        return self._band_table
+
+    def interpolate_band_table(self, cartesian, columns):
+        """interpolated_bands() for the selected band columns, from band_table().
+
+        Much faster for many points and few bands; no nearest-point distance.
+        """
+        table = self.band_table()[:, columns]
+        target = np.asarray(cartesian, dtype=float).reshape(-1, 3)
+        scaled = (target @ np.linalg.inv(G)) * self.ns
+        lower = np.floor(scaled).astype(np.int64)
+        fraction = scaled - lower
+        values = np.zeros((len(target), table.shape[1]))
+        for bits in itertools.product((0, 1), repeat=3):
+            offset = np.asarray(bits, dtype=np.int64)
+            indices = np.ravel_multi_index(((lower + offset) % self.ns).T, tuple(self.ns))
+            weight = np.prod(np.where(offset, fraction, 1.0-fraction), axis=1)
+            values += weight[:, None] * table[indices]
+        return values
 
     def interpolated_bands(self, cartesian):
         """Periodically trilinear-interpolate scalar eigenvalues on the mesh.

@@ -2,7 +2,7 @@
 
 English | [日本語](README_JP.md)
 
-Current version: **1.2.0**
+Current version: **1.3.0**
 
 SPADExp4D is research software for calculating and visualizing photoemission angular distributions (PADs) for angle-resolved photoemission spectroscopy (ARPES) in four-dimensional `(kx, ky, kz, E)` space using output from the first-principles code OpenMX.
 
@@ -169,7 +169,7 @@ structures/<structure_name>/
 └── results/      generated, ignored by Git
 ```
 
-Automatic processing does not support partial occupancy, disordered sites, or undefined elements.
+Automatic processing does not support partial occupancy, disordered sites, or undefined elements. When a CIF cannot be used, `Import CIF` explains each problem in plain English and does not add the structure: missing or invalid cell values, no atom list or no fractional coordinates, type symbols that are not elements (for example placeholders such as `T` or `X1` from a structure template), partly occupied sites, several atoms at one position, and elements for which OpenMX has no basis set. cif2omx messages are under Show Details.
 
 ## GUI operation
 
@@ -189,11 +189,13 @@ The `OpenMX Parameters` tab edits OpenMX keywords per calculation target:
 - With `scf.SpinPolarization on` the PAD of both spins is summed; with `NC` both spinor components are summed. Use `NC` with `scf.SpinOrbit.Coupling` for spin-orbit coupling in a paramagnetic state.
 - `Stored bands E−EF` limits the bands stored in the k-space HDF5 to an energy window (`All` stores every band). For NC, a window covering the EB range of interest reduces HDF5 size and memory several-fold; states outside it are absent from PAD.
 
-Confirm the dialog with `Yes` to start. OpenMX logs and progress are shown while running; use `Cancel` to stop when necessary.
+Before OpenMX runs, the dialog “Calculate the eigenstates of <target> with OpenMX now?” shows the k mesh, any k points already saved by an interrupted run, and how many will be calculated. Choose `Yes` to start, or `No` to stop and, for example, change N1, N2, N3 first. OpenMX logs and progress are shown while running; use `Cancel` to stop when necessary.
+
+The `Results` tab shows `K-space HDF5`: the k-space HDF5 file used for the PAD, when it was calculated, the OpenMX and HDF5 conversion times (total and wall time), and its size. The tooltip shows the full path. The times are stored in the k-space HDF5 file itself (attribute `CalculationTiming`), so they are also shown when the cache is reused, after a restart, and for an opened PAD result. A calculation that was interrupted and resumed adds up the time spent before the interruption. Caches made before this version have no recorded times and show only the date and size.
 
 ### 3. Set PAD conditions (`PAD` tab)
 
-Below `K-space HDF5`, the settings are split into the `PAD` and `Band Diagram` tabs. The `PAD` tab lists, in order:
+Below the OpenMX tabs, the settings are split into the `PAD` and `Band Diagram` tabs. The `PAD` tab lists, in order:
 
 - `PAD calculation`: `C++ batch` or the comparison `Python per EB (comparison)` backend
 - `hν`: photon energy
@@ -202,7 +204,8 @@ Below `K-space HDF5`, the settings are split into the `PAD` and `Band Diagram` t
 - `EF shift`: display-only Fermi-level shift
 - `V0`: inner potential; `V0 <= 0` uses the automatic setting
 - `wfnc`: photoelectron wavefunction parameter
-- `Slice direction`: `kx`, `ky`, or `kz`, the direction of the PAD and band slices
+- `Slice direction`: `kx` or `ky`, the direction of the PAD and band slices
+- `ky fixed` (`kx fixed` for a `ky` slice): the fixed coordinate that places the slice (see 4)
 - `KMin, KMax, Kstep`: displayed momentum range and step
 - `EB Begin, End, Step`: binding-energy range and step
 - `Gaussian dK`, `Gaussian dE`: momentum- and energy-direction Gaussian smoothing of saved PAD data; changing them does not require OpenMX or PAD recalculation
@@ -211,11 +214,20 @@ Below `K-space HDF5`, the settings are split into the `PAD` and `Band Diagram` t
 
 Changing PAD conditions reuses the first-Brillouin-zone eigenstate cache.
 
-### 4. Set the band-diagram cut (`Band Diagram` tab)
+### 4. Slice coordinates and the figure (`Band Diagram` tab)
 
-Set the fixed coordinates of the slice chosen with `Slice direction`. For a `kx` slice, `ky fixed` sets ky; kz is not fixed but follows the photoemission sphere at each EB, kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²), so `kz fixed` is disabled (likewise for `ky`). For a `kz` slice, `kx fixed` and `ky fixed` set the point the trajectory passes through.
+The `Band Diagram` tab is reserved for band-diagram settings that are not implemented yet, so it is disabled in this version. It holds only the second fixed coordinate, which keeps the value saved in `parameter.json` (or in an opened result file); the first one is in the `PAD` tab under `Slice direction`. The fixed coordinates of the slice chosen with `Slice direction` are as follows. For a `kx` slice, `ky fixed` (`PAD` tab) sets ky; kz is not fixed but follows the photoemission sphere at each EB, kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²), so `kz fixed` is not used (likewise for a `ky` slice, with `kx fixed`). `Slice direction` offers only `kx` and `ky`; settings with a `kz` slice saved by an earlier version open as `kx`, and result files with a `kz` slice are still displayed.
 
-The figure shows `Band Slice EB′` and `PAD: EB′` (kx–ky maps at the selected EB), `Band Slice kx-EB` and `PAD Slice kx-EB` (the slice versus EB), `Band Diagram (PAD cut)` and the kx–kz photoelectron trajectories. `Band Diagram (PAD cut)` is not a band structure at a fixed kz: it shows the bands at the k points the PAD slice actually samples, i.e. where EB = −E_n(kx, ky, kz(EB)), so it can be compared directly with `PAD Slice kx-EB`.
+Choose the figure layout with `Display type` above `Calc` (no recalculation needed).
+
+| Display type | Panels |
+|---|---|
+| `Normal` (default) | 2×2: top left `Band Diagram EB′` (band contours at the selected EB), top right `PAD: EB′`, bottom left `Band Diagram (PAD cut)`, bottom right `PAD Slice kx-EB` |
+| `With Photoelectron kz` | 3×2: `Band Slice EB′` and `PAD: EB′` (kx–ky maps at the selected EB), `Band Slice kx-EB` and `PAD Slice kx-EB` (the slice versus EB), `Band Diagram (PAD cut)` and the kx–kz photoelectron trajectories |
+
+`Band Diagram EB′` draws, as lines, where the bands cross the photoemission sphere that the PAD map samples at the selected EB, kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²), i.e. where EB = −E_n(kx, ky, kz). The line colour is the PAD at that position (after the same Gaussian dK/dE as `PAD: EB′`), on a scale from the minimum to the maximum PAD shown at that EB (rainbow, colour bar `PAD`); lines where there is no PAD (outside the photoemission horizon or θmax) are grey. The contours are computed for every EB with each calculation and stored with the result; older results without them get them from the k-space HDF5, if it is available, when displayed.
+
+In both layouts, `Band Diagram (PAD cut)` is not a band structure at a fixed kz: it shows the bands at the k points the PAD slice actually samples, i.e. where EB = −E_n(kx, ky, kz(EB)), so it can be compared directly with `PAD Slice kx-EB`. Each band is coloured (rainbow) by the PAD at its position in the slice, after the Gaussian dK/dE, on a scale from the minimum to the maximum PAD of the slice in the displayed range (colour bar `PAD`). Bands where the slice has no PAD (outside the photoemission horizon or θmax) are grey. All panels have the width and horizontal position of the kx–ky maps at the top, so the k axes line up in each column.
 
 ### 5. Reuse and save results
 
@@ -225,7 +237,7 @@ Settings are saved in files such as each structure's `parameter.json`. For exter
 
 #### Restoring the last session
 
-On exit, the calculation target, every parameter in the sidebar, the selected tabs, the EB position and the window size are saved in `python/spadexp_4d.ini.json`. Each finished calculation is also written to `<calculation target>/cache/last_pad_result.h5`. At the next start, the same target is selected and its last PAD result is shown without recalculation. Gaussian dK/dE, EF shift, θmax and boundary changes made after the calculation are kept. If a PAD result file was open at exit, that file is shown instead.
+On exit, the calculation target, every parameter in the sidebar, the selected tabs, `Display type`, the EB position and the window size are saved in `python/spadexp_4d.ini.json`. Each finished calculation is also written to `<calculation target>/cache/last_pad_result.h5`. At the next start, the same target is selected and its last PAD result is shown without recalculation. Gaussian dK/dE, EF shift, θmax and boundary changes made after the calculation are kept. The sidebar parameters come back exactly as they were shown at exit, even a combination that cannot be used yet (for example EB End − EB Begin not a whole multiple of EB Step); the reason is then shown in red above `Calc`, which refuses it until fixed, and `parameter.json` keeps the last valid values. Switching targets uses the parameters saved for that target; only choosing an entry under `Calculation result` loads the conditions of that calculation. If a PAD result file was open at exit, that file is shown instead.
 
 #### Saving and opening PAD results (HDF5)
 
@@ -238,7 +250,8 @@ On exit, the calculation target, every parameter in the sidebar, the selected ta
 | `PAD` | `binding_energy` (eV), `k` (Å⁻¹, shared by kx and ky), unbroadened `pad` and `band_weight` (EB, ky, kx; gzip), `nearest_eigenstate_distance`; attributes `v0_eV`, `request_json` |
 | `BandCut` | bands along the PAD slice: `k` and `energy` (E − EF, eV; NaN outside the slice) for lines, `points` (k, E − EF) where a band meets one k more than once or for a kz slice |
 | `Structure` | `cif`, `openmx_template` (`.openmx.base.dat`), `lattice` (Å), `reciprocal` (Å⁻¹) |
-| `Calculation` | k-space HDF5 path and size, OpenMX/conversion/PAD times, maximum sampling distance |
+| `BandContours` | band contours at every EB (`Band Diagram EB′`): `binding_energy`, `offsets` (EB i owns segments `offsets[i]:offsets[i+1]`), `segments` (kx, ky of both segment ends, 1/Å) |
+| `Calculation` | k-space HDF5 path and size, OpenMX/conversion/PAD times, the k-space HDF5 calculation record (`mesh_timing`, JSON), maximum sampling distance |
 
 Gaussian dK/dE are stored as settings and applied when the file is shown, so the stored PAD stays unbroadened. The k-space HDF5 (eigenstates) is not included; a new `Calc` with changed conditions needs it or recomputes it.
 

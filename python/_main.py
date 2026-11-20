@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """4-D (kx, ky, kz, E) viewer using a reusable first-BZ eigenstate database."""
 
-# SPADExp4D 1.2.0: integrated Python, C++ and per-Structure caches.
+# SPADExp4D 1.3.0: integrated Python, C++ and per-Structure caches.
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import argparse
 import hashlib
@@ -38,6 +38,8 @@ import matplotlib
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.collections import LineCollection
+import contourpy
 
 # The application and its C++ helpers live together; large runtime data stays
 # at the project root so existing first-BZ and PAD caches remain reusable.
@@ -74,6 +76,21 @@ K_HALF, K_LIMIT, DK = 3.0, 10.0, 0.075
 POLARIZATIONS = ("lx", "ly", "c+", "c-", "unpolarized")
 # Beamline presets for the Euler angles (a, b, c) in degrees, offered by the
 # "Incident Angles (zyz Euler)" button.  a and c may be negative (-360 to 360).
+# Figure layouts: "Normal" shows band contours and the PAD at the selected EB
+# with the band diagram and the PAD along the slice (2x2); "With Photoelectron
+# kz" adds the band weight panels and the kx-kz trajectories (3x2).
+DISPLAY_TYPES = (("Normal", "normal"), ("With Photoelectron kz", "photoelectron_kz"))
+
+# Slice directions offered in the GUI (results with a kz slice from earlier
+# versions are still drawn).
+SLICE_DIRECTIONS = ("kx", "ky")
+
+
+def gui_direction(direction):
+    """The slice direction to select in the GUI; anything else becomes kx."""
+    return direction if direction in SLICE_DIRECTIONS else SLICE_DIRECTIONS[0]
+
+
 EULER_PRESETS = (
     ("SPring-8 BL25SU", (0.0, 90.0, -90.0)),
     ("UVSOR PMM", (0.0, 68.0, -90.0)),
@@ -114,7 +131,8 @@ PAD_RESULT_VERSION = 1
 LAST_PAD_RESULT = "last_pad_result.h5"
 PAD_RESULT_FILTER = "SPADExp4D PAD result (*.h5 *.hdf5);;All files (*)"
 CALCULATION_KEYS = ("mesh_path", "mesh_bytes", "openmx_seconds", "conversion_seconds",
-                    "openmx_hdf5_seconds", "mesh_seconds", "pad_seconds", "pad_kernel_seconds",
+                    "openmx_hdf5_seconds", "mesh_seconds", "mesh_reused", "mesh_timing",
+                    "pad_seconds", "pad_kernel_seconds",
                     "pad_computed_slices", "result_record")
 
 
@@ -240,10 +258,14 @@ def validate_settings(settings):
         raise ValueError("k step must be positive.")
     k_intervals = (normalized["k_max"] - normalized["k_min"]) / normalized["k_step"]
     if k_intervals < 1 or not np.isclose(k_intervals, round(k_intervals), rtol=0, atol=1e-7):
-        raise ValueError("k Max - k Min must be an integer multiple of k step.")
+        raise ValueError(f"KMax − KMin must be a whole multiple of Kstep: "
+                         f"({normalized['k_max']:g} − {normalized['k_min']:g}) / {normalized['k_step']:g} "
+                         f"= {k_intervals:.4g}.")
     intervals = (normalized["eb_max"] - normalized["eb_min"]) / normalized["de"]
     if intervals < 1 or not np.isclose(intervals, round(intervals), rtol=0, atol=1e-7):
-        raise ValueError("eb_max - eb_min must be an integer multiple of de.")
+        raise ValueError(f"EB End − EB Begin must be a whole multiple of EB Step: "
+                         f"({normalized['eb_max']:g} − {normalized['eb_min']:g}) / {normalized['de']:g} "
+                         f"= {intervals:.4g}.")
     normalized.update(zip(("N1", "N2", "N3"), core.divisions(settings)))
     normalized["use_first_bz_only"] = True
     normalized["pad_engine"] = settings.get("pad_engine", "cpp")
@@ -429,10 +451,11 @@ def register_local_result(structure_path, settings, mesh_path, result=None):
         "mesh_path": str(mesh_path), "mesh_bytes": mesh_path.stat().st_size,
     }
     if result:
+        record = mesh_timing_record(result) or {}
+        openmx = float(record.get("openmx_seconds", 0.0))
+        conversion = float(record.get("conversion_seconds", 0.0))
         manifest["timing_seconds"] = {
-            "openmx": float(result.get("openmx_seconds", 0.0)),
-            "hdf5_conversion": float(result.get("conversion_seconds", 0.0)),
-            "total": float(result.get("openmx_hdf5_seconds", 0.0)),
+            "openmx": openmx, "hdf5_conversion": conversion, "total": openmx + conversion,
             "pad": float(result.get("pad_seconds", 0.0)),
         }
     core.json_write(target / "manifest.json", manifest)
@@ -445,6 +468,82 @@ def register_local_result(structure_path, settings, mesh_path, result=None):
     })
     prune_duplicate_local_results(structure_path)
     return target
+
+
+def mesh_timing_record(result):
+    """How long the k-space HDF5 of a result took to calculate, or None.
+
+    Uses the record saved with the result, then the one stored in the k-space
+    HDF5 file, then the times of the run that produced the result.
+    """
+    if not result:
+        return None
+    if "mesh_timing" in result:  # read once by the worker (None: nothing stored)
+        record = result["mesh_timing"]
+    else:  # a result file written before the record was kept
+        path = result.get("mesh_path")
+        record = core.mesh_timing(path) if path and Path(path).is_file() else None
+    record = dict(record) if isinstance(record, dict) else {}
+    if "openmx_seconds" not in record:
+        openmx = float(result.get("openmx_seconds") or 0.0)
+        conversion = float(result.get("conversion_seconds") or 0.0)
+        if openmx or conversion:
+            record.update(openmx_seconds=openmx, conversion_seconds=conversion,
+                          wall_seconds=float(result.get("mesh_seconds") or openmx + conversion))
+    return record or None
+
+
+def format_timestamp(text):
+    """Show an ISO or 'YYYY-MM-DD HH:MM:SS' time as local 'YYYY-MM-DD HH:MM'."""
+    try:
+        moment = datetime.fromisoformat(str(text))
+    except ValueError:
+        return str(text)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.strftime("%Y-%m-%d %H:%M")
+
+
+def mesh_result_lines(result):
+    """Lines of the Results tab's K-space HDF5 entry."""
+    path = Path(result.get("mesh_path", ""))
+    lines = [str(Path(path.parent.name) / path.name) if path.name else "unknown"]
+    record = mesh_timing_record(result) or {}
+    when = record.get("completed_at") or record.get("created")
+    if when:
+        lines.append(f"Calculated {format_timestamp(when)}")
+    if "openmx_seconds" in record:
+        openmx = float(record["openmx_seconds"]); conversion = float(record.get("conversion_seconds", 0.0))
+        lines.append(f"OpenMX {format_duration(openmx)} / HDF5 conversion {format_duration(conversion)}")
+        total = f"Total {format_duration(openmx + conversion)}"
+        if record.get("wall_seconds"):
+            total += f" (wall time {format_duration(float(record['wall_seconds']))})"
+        lines.append(total)
+    else:
+        lines.append("Calculation time: not recorded in this cache")
+    if result.get("mesh_reused"):
+        lines.append(f"Reused this run (checked in {format_duration(float(result.get('mesh_seconds') or 0.0))})")
+    lines.append(format_file_size(result["mesh_bytes"]))
+    return lines
+
+
+def mesh_confirmation_text(name, divisions, count, saved):
+    """Question and details of the dialog shown before OpenMX runs (Yes starts it)."""
+    missing = max(count - saved, 0)
+    n1, n2, n3 = divisions
+    if saved <= 0:
+        progress = f"Nothing is saved for this mesh yet, so all {count:,} k points will be calculated."
+    else:
+        progress = (f"{saved:,} k points are already saved from an interrupted run; "
+                    f"the remaining {missing:,} will be calculated.")
+    question = f"Calculate the eigenstates of {name} with OpenMX now?"
+    details = (f"First-BZ k mesh: N1 × N2 × N3 = {n1} × {n2} × {n3} = {count:,} k points.\n"
+               f"{progress}\n"
+               "This can take a long time. The saved mesh is then reused for every PAD "
+               "calculation, even when hν, polarization or other PAD conditions change.\n\n"
+               "Yes: start the OpenMX calculation (you can cancel it while it runs).\n"
+               "No: do not calculate now, e.g. to change N1, N2, N3 first.")
+    return question, details
 
 
 def sha256_file(path):
@@ -900,6 +999,15 @@ def save_pad_result(path, result, structure_path=None):
             if line.get("points") is not None:
                 cut.create_dataset("points", data=np.asarray(line["points"], dtype=float).reshape(-1, 2)
                                    ).attrs["units"] = "k (1/Angstrom), E - EF (eV)"
+        contours = result.get("contours")
+        if contours:
+            group = f.create_group("BandContours")
+            group.attrs["method"] = str(contours.get("method", ""))
+            group.create_dataset("binding_energy", data=np.asarray(contours["eb"], dtype=float)).attrs["units"] = "eV"
+            group.create_dataset("offsets", data=np.asarray(contours["offsets"], dtype=np.int64)
+                                 ).attrs["description"] = "EB slice i owns segments offsets[i]:offsets[i+1]"
+            group.create_dataset("segments", data=np.asarray(contours["segments"], dtype=np.float32).reshape(-1, 2, 2),
+                                 compression="gzip", shuffle=True).attrs["units"] = "kx, ky (1/Angstrom)"
         crystal = f.create_group("Structure")
         crystal.create_dataset("lattice", data=lattice).attrs["units"] = "Angstrom (rows a1, a2, a3)"
         crystal.create_dataset("reciprocal", data=reciprocal).attrs["units"] = "1/Angstrom (rows G1, G2, G3)"
@@ -912,7 +1020,9 @@ def save_pad_result(path, result, structure_path=None):
         calculation.attrs["sampling_error"] = float(result.get("sampling_error", error.max(initial=0)))
         for key in CALCULATION_KEYS:
             value = result.get(key)
-            if isinstance(value, (int, float, np.integer, np.floating)):
+            if isinstance(value, dict):
+                calculation.attrs[key] = json.dumps(value, sort_keys=True)
+            elif isinstance(value, (int, float, np.integer, np.floating)):
                 calculation.attrs[key] = value
             elif value is not None:
                 calculation.attrs[key] = str(value)
@@ -955,6 +1065,11 @@ def load_pad_result(path):
                                   "error": float(cut.attrs.get("error", 0.0)),
                                   "method": str(cut.attrs.get("method", "")),
                                   "path": str(cut.attrs.get("path", ""))}
+            if "BandContours" in f:
+                group = f["BandContours"]
+                result["contours"] = {"eb": group["binding_energy"][()], "offsets": group["offsets"][()],
+                                      "segments": group["segments"][()],
+                                      "method": str(group.attrs.get("method", ""))}
             crystal = f["Structure"]
             result["lattice"] = crystal["lattice"][()]; result["reciprocal"] = crystal["reciprocal"][()]
             structure = {key: crystal[key].asstr()[()] for key in ("cif", "openmx_template") if key in crystal}
@@ -965,7 +1080,13 @@ def load_pad_result(path):
             for key in CALCULATION_KEYS:
                 if key in calculation:
                     value = calculation[key]
-                    result[key] = value.item() if isinstance(value, np.generic) else value
+                    value = value.item() if isinstance(value, np.generic) else value
+                    if key == "mesh_timing":
+                        try:
+                            value = json.loads(value)
+                        except (TypeError, ValueError):
+                            continue
+                    result[key] = value
             result["sampling_error"] = float(calculation.get("sampling_error", error.max(initial=0)))
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not read the PAD result file {path}: {exc}") from exc
@@ -1157,6 +1278,9 @@ def cut_slice(data, s, v0):
     return result
 
 
+PAD_SLICE_PATH = 'photoemission sphere along the PAD slice'
+
+
 def slice_path(s):
     """In-plane (kx, ky) of the PAD slice; kz follows the photoemission sphere."""
     axis = cartesian_axis(s)
@@ -1223,8 +1347,184 @@ def pad_cut_bands(grid, s, v0, rows_per_chunk=None):
     return {'k': cartesian_axis(s) if s['direction'] != 'kz' else None,
             'bands': lines if s['direction'] != 'kz' else None,
             'points': np.column_stack((k_points, -root[rest])),
-            'error': error, 'path': 'photoemission sphere along the PAD slice',
+            'error': error, 'path': PAD_SLICE_PATH,
             'method': 'EB = -E_n(k(EB)) crossings; periodic trilinear interpolation of eigenvalues'}
+
+
+def pad_slice_values(cuts, s):
+    """Displayed PAD of the slice as (EB rows, k columns); NaN where not shown."""
+    ebs = energies(s); columns = 1 if s['direction'] == 'kz' else len(cartesian_axis(s))
+    values = np.full((len(ebs), columns), np.nan)
+    for i, eb in enumerate(ebs):
+        if eb in cuts:
+            values[i] = np.asarray(cuts[eb]['pad'], dtype=float).reshape(-1)[:columns]
+    return values
+
+
+def pad_at_bands(values, s, column, eb):
+    """PAD at band positions: the larger of the two EB rows around each EB.
+
+    Using the larger row keeps the intensity of a band that the PAD binned
+    into the neighbouring EB row (its nearest-mesh energy differs slightly
+    from the interpolated band energy).
+    """
+    position = (np.asarray(eb, dtype=float) - s['eb_min']) / s['de']
+    lower = np.clip(np.floor(position), 0, len(values) - 1).astype(int)
+    upper = np.minimum(lower + 1, len(values) - 1)
+    column = np.clip(np.asarray(column, dtype=int), 0, values.shape[1] - 1)
+    return np.fmax(values[lower, column], values[upper, column])
+
+
+def pad_colored_bands(line, cuts, s):
+    """Band-diagram geometry with the PAD intensity of every band position.
+
+    The intensity is the displayed (Gaussian dK/dE) PAD of the slice where the
+    band lies, so the colours match the PAD Slice panel.  Coordinates are raw
+    EB (no EF shift).  'range' is the minimum and maximum PAD of the slice in
+    the displayed k and EB range (NaN when no PAD is available yet).
+    """
+    values = pad_slice_values(cuts, s); finite = values[np.isfinite(values)]
+    value_range = (float(finite.min()), float(finite.max())) if finite.size else (np.nan, np.nan)
+    segments = np.zeros((0, 2, 2)); segment_values = np.zeros(0)
+    if line.get('k') is not None and line.get('bands') is not None:
+        k = np.asarray(line['k'], dtype=float); eb = -np.asarray(line['bands'], dtype=float)
+        intensity = np.full(eb.shape, np.nan)
+        j, b = np.nonzero(np.isfinite(eb))
+        intensity[j, b] = pad_at_bands(values, s, j, eb[j, b])
+        j, b = np.nonzero(np.isfinite(eb[:-1]) & np.isfinite(eb[1:]))
+        segments = np.stack((np.column_stack((k[j], eb[j, b])),
+                             np.column_stack((k[j + 1], eb[j + 1, b]))), axis=1).reshape(-1, 2, 2)
+        first, second = intensity[j, b], intensity[j + 1, b]
+        segment_values = np.where(np.isnan(first), second,
+                                  np.where(np.isnan(second), first, (first + second) / 2))
+    points = np.asarray(line.get('points', np.zeros((0, 2))), dtype=float).reshape(-1, 2)
+    xy = np.column_stack((points[:, 0], -points[:, 1]))
+    if s['direction'] == 'kz':
+        column = np.zeros(len(points), dtype=int)
+    else:
+        column = np.rint((points[:, 0] - s['k_min']) / s['k_step']).astype(int)
+    point_values = pad_at_bands(values, s, column, xy[:, 1]) if len(points) else np.zeros(0)
+    return dict(segments=segments, segment_values=segment_values, points=xy,
+                point_values=point_values, range=value_range)
+
+
+SPHERE_CONTOUR_POINTS = 151  # kx (and ky) samples of the band contour grid, at most
+SPHERE_CONTOUR_METHOD = ('EB + E_n(kx, ky, kz(EB)) = 0 contours on the photoemission sphere (contourpy); '
+                         'periodic trilinear interpolation of eigenvalues')
+# Bands coloured by PAD: rainbow, grey where there is no PAD.
+PAD_BAND_CMAP = matplotlib.colormaps['rainbow'].with_extremes(bad=(.75, .75, .75, 1.0))
+
+
+def sphere_band_contours(grid, s, v0, stop=None):
+    """Constant-EB band contours on the photoemission sphere.
+
+    The PAD map at binding energy EB samples k = (kx, ky, kz) with
+    kz = sqrt((hν + V0 − EB)/H2M − kx² − ky²).  Band n crosses that map where
+    EB + E_n(k) = 0 (E relative to EF); these lines are traced on an in-plane
+    grid of at most SPHERE_CONTOUR_POINTS² points with the eigenvalues
+    trilinearly interpolated on the first-BZ mesh.  Only bands whose energy
+    range contains −EB are evaluated.
+
+    Returns 'eb' (raw EB of each slice), 'offsets' (slice i owns segments
+    offsets[i]:offsets[i+1]) and 'segments' ((M, 2, 2) kx, ky in 1/Å).
+    """
+    ebs = np.asarray(energies(s), dtype=float); axis = cartesian_axis(s)
+    xs = np.linspace(axis[0], axis[-1], min(len(axis), SPHERE_CONTOUR_POINTS))
+    kx, ky = np.meshgrid(xs, xs); kp2 = kx * kx + ky * ky
+    table = grid.band_table(); low, high = table.min(axis=0), table.max(axis=0)
+    pieces, offsets = [], [0]
+    for eb in ebs:
+        core.check_stop(stop)
+        columns = np.flatnonzero((low <= -eb) & (high >= -eb))
+        z2 = (s['hv'] + v0 - eb) / H2M - kp2; inside = z2 >= 0
+        found = []
+        if len(columns) and inside.any():
+            field = np.full(kx.shape + (len(columns),), np.nan)
+            cart = np.stack((kx[inside], ky[inside], np.sqrt(z2[inside])), axis=1)
+            field[inside] = eb + grid.interpolate_band_table(cart, columns)
+            for band in range(len(columns)):
+                generator = contourpy.contour_generator(
+                    xs, xs, np.ma.masked_invalid(field[..., band]), line_type=contourpy.LineType.Separate)
+                for path in generator.lines(0.0):
+                    if len(path) > 1:
+                        found.append(np.stack((path[:-1], path[1:]), axis=1))
+        segments = np.concatenate(found).astype(np.float32) if found else np.zeros((0, 2, 2), np.float32)
+        pieces.append(segments); offsets.append(offsets[-1] + len(segments))
+    return {'eb': ebs, 'offsets': np.asarray(offsets, dtype=np.int64),
+            'segments': np.concatenate(pieces), 'method': SPHERE_CONTOUR_METHOD}
+
+
+def contour_segments(contours, eb):
+    """Band contour segments (kx, ky) of one EB slice, or None if not available."""
+    if not contours:
+        return None
+    hit = np.flatnonzero(np.isclose(np.asarray(contours['eb'], dtype=float), eb, rtol=0, atol=1e-6))
+    if not len(hit):
+        return None
+    start, stop = np.asarray(contours['offsets'])[[hit[0], hit[0] + 1]]
+    return np.asarray(contours['segments'][start:stop], dtype=float).reshape(-1, 2, 2)
+
+
+def pad_colored_contours(segments, pad, axis):
+    """PAD (displayed kx-ky map, NaN where hidden) at every contour segment.
+
+    Each segment takes the PAD at its midpoint.  'range' is the minimum and
+    maximum of the visible PAD of the map (NaN when nothing is visible).
+    """
+    finite = pad[np.isfinite(pad)]
+    value_range = (float(finite.min()), float(finite.max())) if finite.size else (np.nan, np.nan)
+    if not len(segments):
+        return np.zeros(0), value_range
+    middle = segments.mean(axis=1)
+    return interpolate_square(pad, axis, middle[:, 0], middle[:, 1]), value_range
+
+
+def pad_band_limits(value_range):
+    """Colour limits of PAD-coloured bands for a (min, max) PAD range."""
+    low, high = value_range
+    if not np.isfinite(low):
+        return 0.0, 1.0
+    return low, (high if high > low else low + 1.0)
+
+
+def panel_colorbar(fig, mappable, ax, label):
+    """Colour bar beside a panel, as tall as the panel itself.
+
+    Constrained layout reserves the colour bar's space next to the panel's
+    cell; a panel with a fixed box (kx-ky maps, equal widths) can be shorter
+    than that cell, so the bar is moved to the panel's height at draw time.
+    """
+    colorbar = fig.colorbar(mappable, ax=ax, label=label)
+    def locate(cax, renderer):
+        ax.apply_aspect()
+        own, panel = cax.get_position(original=True), ax.get_position(original=False)
+        return matplotlib.transforms.Bbox.from_bounds(own.x0, panel.y0, own.width, panel.height)
+    colorbar.ax.set_axes_locator(locate)
+    return colorbar
+
+
+def ensure_band_contours(result):
+    """Band contours of a result saved before they were kept, from its k-space HDF5.
+
+    The contours are added to the result.  Returns None when the k-space HDF5
+    is not available.
+    """
+    if result.get('contours') is not None or result.get('contours_error'):
+        return result.get('contours')
+    path = result.get('mesh_path')
+    if not path or not Path(path).is_file():
+        result['contours_error'] = 'k-space HDF5 not available'
+        return None
+    try:
+        grid = core.EigenstateGrid(path)
+        try:
+            result['contours'] = sphere_band_contours(grid, result['s'], result['v0'])
+        finally:
+            grid.close()
+    except (OSError, KeyError, ValueError, RuntimeError) as exc:
+        result['contours_error'] = str(exc)
+        return None
+    return result['contours']
 
 
 def prepare_display(result, settings, stop=None):
@@ -1322,12 +1622,21 @@ class Worker(QtCore.QObject):
             result['mesh_seconds'] = time.monotonic() - mesh_started
             result['mesh_path'] = str(path)
             result['mesh_bytes'] = path.stat().st_size
+            result['mesh_reused'] = not (elapsed or openmx_total or conversion_total)
+            # The OpenMX/HDF5 times stored in the cache itself, so they are
+            # shown again when the cache is reused or the result reopened.
+            result['mesh_timing'] = core.mesh_timing(path)
             self.log.emit(f"[K-space HDF5] {path}; {format_file_size(result['mesh_bytes'])}")
             core.check_stop(self.stop_event.is_set)
             grid = core.EigenstateGrid(path)
             self.log.emit(f'[HDF5] {path}; LCAO=float32 + gzip; all first-BZ points complete')
             result['line'] = pad_cut_bands(grid, self.s, v0)
             result['sampling_error'] = result['line']['error']
+            contour_started = time.monotonic()
+            result['contours'] = sphere_band_contours(grid, self.s, v0, self.stop_event.is_set)
+            self.log.emit(f"[Band contours] {len(result['contours']['segments']):,} segments for "
+                          f"{len(result['contours']['eb'])} EB slices in "
+                          f"{format_duration(time.monotonic() - contour_started)}")
             self.snapshot(result)
             requested = energies(self.s); components = polarization_components(self.s)
             combined = {}
@@ -1421,6 +1730,34 @@ class DisplayRelay(QtCore.QObject):
     ready = QtCore.pyqtSignal(int, object, object)  # job, display result, error text
 
 
+class FitScrollArea(QtWidgets.QScrollArea):
+    """A vertical scroll area no taller than its contents.
+
+    It asks for the full height of its widget and never grows beyond it, so the
+    space left in the sidebar goes to the log; it only scrolls when the window
+    is too short to show every parameter.
+    """
+    def __init__(self, widget):
+        super().__init__()
+        self.setWidgetResizable(True); self.setWidget(widget)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Maximum)
+        widget.installEventFilter(self)
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        if self.widget() is not None:
+            hint.setHeight(self.widget().sizeHint().height() + 2 * self.frameWidth())
+        return hint
+
+    def eventFilter(self, watched, event):
+        # The contents changed size (e.g. a wrapped label): ask the sidebar
+        # layout for a new height.
+        if watched is self.widget() and event.type() == QtCore.QEvent.Type.LayoutRequest:
+            self.updateGeometry()
+        return super().eventFilter(watched, event)
+
+
 class Window(QtWidgets.QMainWindow):
     def __init__(self, initial_settings, session=False):
         super().__init__(); self.setWindowTitle("SPADExp4D — first-BZ eigenstate cache"); self.resize(1500,1050)
@@ -1430,6 +1767,7 @@ class Window(QtWidgets.QMainWindow):
         # state and PAD result, save them again on exit, and keep every
         # finished result in <target>/cache/LAST_PAD_RESULT.
         self.persist_session = session
+        self.save_on_exit = True  # parameter.json of the target is saved when the window closes
         self._session = read_session() if session else {}
         self._preferred_structure = self._session.get("structure")
         self.result = self.thread = self.worker = None; self._closing = False
@@ -1512,16 +1850,19 @@ class Window(QtWidgets.QMainWindow):
             kg.addWidget(label,1+i,0,1,2)
         self.total_points=QtWidgets.QLabel(); self.total_points.setWordWrap(True)
         kg.addWidget(QtWidgets.QLabel("Total k-point count"),4,0); kg.addWidget(self.total_points,4,1)
-        kg.setColumnStretch(1,1)
+        kg.setColumnStretch(1,1); kg.setRowStretch(5,1)  # rows packed at the top
         self.openmx_tabs.addTab(division,"OpenMX K division")
         self.openmx_tabs.addTab(self.build_openmx_parameters(inline),"OpenMX Parameters")
         self.openmx_tabs.setTabToolTip(1,OPENMX_PARAMETERS_HELP)
         self.load_openmx_parameters(initial["openmx"]); self.set_band_window(initial["band_window"])
-        add_full_row(self.openmx_tabs)
+        # The Results tab shows the k-space HDF5 file of the last calculation.
         self.mesh_result=QtWidgets.QLabel("Not available"); self.mesh_result.setWordWrap(True)
         self.mesh_result.setTextInteractionFlags(
             QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        add_row("K-space HDF5",self.mesh_result)
+        mesh_label=QtWidgets.QLabel("K-space HDF5")
+        mesh_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft|QtCore.Qt.AlignmentFlag.AlignTop)
+        self.openmx_tabs.addTab(form_page(((mesh_label,self.mesh_result),)),"Results")
+        add_full_row(self.openmx_tabs)
         self.update_mesh_labels()
         self.pad_engine=QtWidgets.QComboBox()
         self.pad_engine.addItem("C++ batch", "cpp"); self.pad_engine.addItem("Python per EB (comparison)", "python")
@@ -1533,7 +1874,7 @@ class Window(QtWidgets.QMainWindow):
             "Moves the band plot and energy slice within the fixed display range.")
         self.eb_min=self.spin(initial["eb_min"],-1000,1000); self.eb_max=self.spin(initial["eb_max"],-1000,1000); self.de=self.spin(initial["de"],.001,100)
         self.eb_min.setToolTip("Negative EB includes eigenstates above the original EF in the PAD calculation.")
-        self.direction=QtWidgets.QComboBox(); self.direction.addItems(("kx","ky","kz")); self.direction.setCurrentText(initial["direction"]); self.direction.currentTextChanged.connect(self.direction_changed)
+        self.direction=QtWidgets.QComboBox(); self.direction.addItems(SLICE_DIRECTIONS); self.direction.setCurrentText(gui_direction(initial["direction"])); self.direction.currentTextChanged.connect(self.direction_changed)
         self.la,self.lb=QtWidgets.QLabel(),QtWidgets.QLabel(); self.a,self.b=self.spin(initial["a"],-20,20),self.spin(initial["b"],-20,20)
         self.polarization=QtWidgets.QComboBox(); self.polarization.addItems(POLARIZATIONS); self.polarization.setCurrentText(initial["polarization"])
         self.polarization.setToolTip("unpolarized adds the c+ and c- PAD intensities")
@@ -1565,6 +1906,9 @@ class Window(QtWidgets.QMainWindow):
             ("V0 (eV; ≤0:auto)",self.v0),
             ("wfnc (eV)",self.wfnc),
             ("Slice direction",self.direction),
+            # The first fixed coordinate (ky for a kx slice) places the PAD
+            # slice, so it is edited here with the slice direction.
+            (self.la,self.a),
             ("KMin, KMax, Kstep (Å⁻¹)",inline(self.k_min,self.k_max,self.k_step)),
             ("EB Begin, End, Step (eV)",inline(self.eb_min,self.eb_max,self.de)),
             ("Gaussian dK (Å⁻¹)",self.dk),
@@ -1572,13 +1916,28 @@ class Window(QtWidgets.QMainWindow):
             ("Maximum angle θmax (°)",self.theta_max),
             ("Boundary",self.show_bz))),"PAD")
         self.parameter_tabs.addTab(form_page((
-            (self.la,self.a),
-            (self.lb,self.b))),"Band Diagram")
+            (self.lb,self.b),)),"Band Diagram")
+        # Band-diagram settings are not implemented yet: the tab is shown but
+        # disabled, and its fixed coordinate keeps its saved value.
+        self.parameter_tabs.setTabEnabled(1,False)
+        self.parameter_tabs.setTabToolTip(1,"Band Diagram settings: not implemented yet")
         add_full_row(self.parameter_tabs)
         parameters=QtWidgets.QWidget(); parameters.setLayout(g)
-        scroll=QtWidgets.QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(parameters)
-        scroll.setHorizontalScrollBarPolicy(
-            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff); side.addWidget(scroll,1)
+        # The parameters take only the height they need; the log below
+        # "Current operation" takes the rest of the window height.
+        self.parameter_scroll=FitScrollArea(parameters); side.addWidget(self.parameter_scroll)
+        # Shown while the entered PAD parameters cannot be used together.
+        self.parameter_warning=QtWidgets.QLabel(); self.parameter_warning.setWordWrap(True)
+        self.parameter_warning.setStyleSheet("color: #b3261e; padding: 2px 0;"); self.parameter_warning.hide()
+        side.addWidget(self.parameter_warning)
+        self.display_type=QtWidgets.QComboBox()
+        for label, value in DISPLAY_TYPES: self.display_type.addItem(label, value)
+        self.display_type.setToolTip("Normal: band contours and PAD at EB, band diagram and PAD along the slice.\n"
+                                     "With Photoelectron kz: also the band weight and the kx-kz trajectories.")
+        self.display_type.currentIndexChanged.connect(self.redraw)
+        display_row=QtWidgets.QHBoxLayout(); display_row.setContentsMargins(0,0,0,0); display_row.setSpacing(4)
+        display_row.addWidget(QtWidgets.QLabel("Display type")); display_row.addWidget(self.display_type,1)
+        side.addLayout(display_row)
         self.calc=QtWidgets.QPushButton("Calc"); self.calc.clicked.connect(self.calculate)
         self.calc.setToolTip("Calculate or load the cache for the current target and parameters")
         side.addWidget(self.calc)
@@ -1608,7 +1967,7 @@ class Window(QtWidgets.QMainWindow):
         self.message=QtWidgets.QLabel("Press Calc")
         self.message.setWordWrap(True); side.addWidget(self.progress); side.addWidget(self.message)
         self.logview=QtWidgets.QPlainTextEdit(); self.logview.setReadOnly(True); self.logview.setMinimumHeight(150); self.logview.setPlaceholderText("OpenMX / SPADExp output")
-        self.logview.document().setMaximumBlockCount(1000); side.addWidget(self.logview)
+        self.logview.document().setMaximumBlockCount(1000); side.addWidget(self.logview,1)
         outer.addWidget(sidebar)
         graphics=QtWidgets.QWidget(); graph=QtWidgets.QVBoxLayout(graphics); graph.setContentsMargins(0,0,0,0); graph.setSpacing(1)
         self.canvas=Canvas(); graph.addWidget(NavigationToolbar2QT(self.canvas,self)); graph.addWidget(self.canvas,1)
@@ -1619,6 +1978,12 @@ class Window(QtWidgets.QMainWindow):
         self._eb_view_timer=QtCore.QTimer(self); self._eb_view_timer.setSingleShot(True)
         self._eb_view_timer.setInterval(0); self._eb_view_timer.timeout.connect(self.update_eb_view)
         outer.addWidget(graphics,1)
+        for widget in (self.hv,self.v0,self.ef_shift,self.wfnc,self.eb_min,self.eb_max,self.de,self.a,self.b,
+                       self.dk,self.dE,self.theta_max,self.alpha,self.beta,self.gamma,self.k_min,self.k_max,
+                       self.k_step,*self.nboxes):
+            widget.valueChanged.connect(self.check_parameters)
+        for widget in (self.direction,self.polarization):
+            widget.currentIndexChanged.connect(self.check_parameters)
         self.refresh_structures()
     OPENMX_LABELS = {
         "scf.XcType": ("scf.XcType", "Exchange-correlation functional"),
@@ -1873,7 +2238,12 @@ class Window(QtWidgets.QMainWindow):
         self.cancel_background_display()
         self.current_structure = next_structure
         self.result = None
-        preferred_result = None
+        # The figure and the K-space HDF5 entry belonged to the previous
+        # target; clear them so the new target (e.g. an imported CIF) is
+        # visibly ready for Calc.
+        self.clear_result_view(f"{next_structure.name}: no PAD result shown.\nPress Calc to calculate."
+                               if next_structure else "Import a CIF to add a calculation target.")
+        preferred_result = None; new_settings = False
         if self.current_structure:
             try:
                 configure_runtime_paths(self.current_structure)
@@ -1887,6 +2257,7 @@ class Window(QtWidgets.QMainWindow):
                     # PAD settings carry over; OpenMX keyword overrides are
                     # material-specific, so a new target starts from its CIF.
                     write_settings(settings_path, dict(self.initial_settings, openmx={}, band_window=None))
+                    new_settings = True
                 selected_settings = read_settings(settings_path)
                 self.apply_settings(selected_settings)
                 # Migrate a completed local first-BZ cache created before the
@@ -1897,6 +2268,8 @@ class Window(QtWidgets.QMainWindow):
                     preferred_result = register_local_result(
                         self.current_structure, selected_settings, plan["path"])
                 self.message.setText(f"Calculation target: {self.current_structure.name}")
+            except core.CifError as exc:
+                self.message.setText(f"{self.current_structure.name} cannot be calculated:\n{exc}")
             except (OSError, ValueError) as exc:
                 self.message.setText(f"Could not load settings: {exc}")
         else:
@@ -1909,10 +2282,48 @@ class Window(QtWidgets.QMainWindow):
                 # Keep the previous lattice until a CIF is imported.
                 pass
             self.load_openmx_parameters({})  # disabled until a target exists
-        self.refresh_results(preferred_result)
+        # The parameters last saved for this target win over the settings of
+        # its saved calculation result; only a target without saved
+        # parameters starts from that result.
+        self.refresh_results(preferred_result, apply_record=new_settings or self.current_structure is None)
 
-    def apply_settings(self, settings):
-        settings = validate_settings(settings); self.initial_settings = settings
+    def restore_entered_values(self, values):
+        """Show the values of the last exit again, even a combination that
+        could not be saved as settings (the sidebar warns about it)."""
+        merged = dict(self.initial_settings)
+        for key, value in values.items():
+            current = merged.get(key)
+            if key not in merged:
+                continue
+            if isinstance(current, bool) or isinstance(value, bool):
+                if isinstance(current, bool) and isinstance(value, bool): merged[key] = value
+            elif isinstance(current, (int, float)):
+                if isinstance(value, (int, float)) and math.isfinite(value): merged[key] = value
+            elif isinstance(current, str):
+                if isinstance(value, str): merged[key] = value
+            elif key == "openmx" and isinstance(value, dict):
+                merged[key] = value
+            elif key == "band_window" and (value is None or isinstance(value, list)):
+                merged[key] = value
+        try:
+            self.apply_settings(merged)
+        except ValueError:
+            self.apply_settings(merged, validate=False)
+
+    def check_parameters(self, *args):
+        """Warn while the entered parameters cannot be used together (Calc
+        would refuse them and they are not saved as settings)."""
+        try:
+            validate_settings(self.settings()); problem = None
+        except ValueError as exc:
+            problem = str(exc)
+        self.parameter_warning.setVisible(problem is not None)
+        if problem is not None:
+            self.parameter_warning.setText(f"⚠ {problem} Fix this before Calc.")
+
+    def apply_settings(self, settings, validate=True):
+        if validate:
+            settings = validate_settings(settings); self.initial_settings = settings
         for key, widget in (("hv", self.hv), ("v0", self.v0), ("ef_shift", self.ef_shift), ("wfnc", self.wfnc),
                             ("eb_min", self.eb_min), ("eb_max", self.eb_max), ("de", self.de),
                             ("a", self.a), ("b", self.b), ("dk", self.dk), ("dE", self.dE),
@@ -1922,13 +2333,14 @@ class Window(QtWidgets.QMainWindow):
             widget.blockSignals(True); widget.setValue(settings[key]); widget.blockSignals(False)
         for i, box in enumerate(self.nboxes, 1):
             box.blockSignals(True); box.setValue(settings[f"N{i}"]); box.blockSignals(False)
-        self.direction.setCurrentText(settings["direction"]); self.polarization.setCurrentText(settings["polarization"])
+        self.direction.setCurrentText(gui_direction(settings["direction"])); self.polarization.setCurrentText(settings["polarization"])
         self.pad_engine.setCurrentIndex(self.pad_engine.findData(settings["pad_engine"]))
         self.show_bz.setChecked(settings["show_bz"]); self.bz_action.setChecked(settings["show_bz"])
         self.load_openmx_parameters(settings["openmx"]); self.set_band_window(settings["band_window"])
         self.update_mesh_labels(); self.direction_changed(); self.update_eb_input()
+        self.check_parameters()
 
-    def refresh_results(self, selected=None):
+    def refresh_results(self, selected=None, apply_record=True):
         previous = self.result_combo.currentData() if self.result_combo.count() else None
         self.result_combo.blockSignals(True); self.result_combo.clear()
         # Keep the new-local-calculation state available even when previous
@@ -1950,7 +2362,7 @@ class Window(QtWidgets.QMainWindow):
         if preferred_index >= 0:
             self.result_combo.setCurrentIndex(preferred_index)
         self.result_combo.blockSignals(False)
-        if self.result_combo.currentData() is not None and self.result is None:
+        if self.result_combo.currentData() is not None and self.result is None and apply_record:
             value = self.result_combo.currentData()
             # setCurrentIndex() happened while signals were blocked above,
             # so load the selected result explicitly.
@@ -1982,10 +2394,20 @@ class Window(QtWidgets.QMainWindow):
         except (OSError, ValueError, KeyError) as exc:
             self.message.setText(f"Could not load saved settings: {exc}")
 
+    def clear_result_view(self, text):
+        """Show no result: an empty figure with a hint, and no K-space HDF5."""
+        self._eb_artists=None; self._eb_background=None
+        fig=self.canvas.figure; fig.clear()
+        fig.text(.5,.5,text,ha='center',va='center',fontsize=13,color='0.35')
+        self.canvas.draw_idle()
+        self.mesh_result.setText("Not available"); self.mesh_result.setToolTip("")
+
     def result_selection_changed(self, index):
         self._stop_eb_sweep()
         value = self.result_combo.itemData(index)
         self.result = None
+        name = self.current_structure.name if self.current_structure else "No target"
+        self.clear_result_view(f"{name}: no PAD result shown.\nPress Calc to calculate or load it.")
         if value:
             self.load_result_settings(value)
         elif self.current_structure:
@@ -2023,13 +2445,26 @@ class Window(QtWidgets.QMainWindow):
         except (OSError, ValueError, RuntimeError) as exc:
             if created:
                 shutil.rmtree(target, ignore_errors=True)
-            QtWidgets.QMessageBox.critical(self, "Structure creation error", str(exc)); return
+            self.show_error(f'Cannot import "{source.name}"', exc); return
         self.refresh_structures()
         index = self.structure_combo.findData(str(target))
         if index >= 0:
             self.structure_combo.setCurrentIndex(index)
         self.message.setText(
             f"CIF imported: {target.name}\nInitial parameters: {defaults_path}")
+
+    def show_error(self, text, exc):
+        """Error box: a short statement, then the problems (a CIF's in plain
+        English with how to fix them) and any technical output under Details."""
+        box=QtWidgets.QMessageBox(self); box.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+        box.setWindowTitle(text); box.setText(text)
+        if isinstance(exc, core.CifError):
+            box.setInformativeText("\n".join(f"• {problem}" for problem in exc.problems)
+                                   + "\n\n" + exc.advice)
+            if exc.details: box.setDetailedText(exc.details)
+        else:
+            box.setInformativeText(str(exc))
+        box.exec()
 
     def create_structure(self):
         """Backward-compatible alias for the former menu action."""
@@ -2042,12 +2477,19 @@ class Window(QtWidgets.QMainWindow):
         """Save the GUI parameters and window state for the next start."""
         if not self.persist_session:
             return
+        values = self.settings()
         try:
-            settings = validate_settings(self.settings())
-        except ValueError as exc:
-            self.append_log(f"Could not save the window state: {exc}"); return
+            settings = validate_settings(values)
+        except ValueError:
+            # An inconsistent combination: the settings file keeps the last
+            # valid settings (it must stay readable at the next start) and the
+            # session keeps the entered values.
+            settings = validate_settings(self.initial_settings)
         pending = self._pending_display or {}
         state = {
+            # Exactly what the sidebar showed, restored at the next start
+            # (also when the combination cannot be used for Calc yet).
+            "values": values,
             "structure": self.current_structure.name if self.current_structure else None,
             "eb": self.eb() if self.result else pending.get("eb"),
             # A result opened from a file is shown again instead of the last
@@ -2055,11 +2497,12 @@ class Window(QtWidgets.QMainWindow):
             "result_file": (self.result or {}).get("source_file") or pending.get("source_file"),
             "parameter_tab": self.parameter_tabs.currentIndex(),
             "openmx_tab": self.openmx_tabs.currentIndex(),
+            "display_type": self.display_type.currentData(),
             "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
         }
         try:
             save_session(settings, state)
-        except (OSError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             self.append_log(f"Could not save the window state: {exc}")
 
     def restore_session(self):
@@ -2068,13 +2511,19 @@ class Window(QtWidgets.QMainWindow):
         name = self.current_structure.name if self.current_structure else None
         same_target = state.get("structure") == name
         if same_target and state:
-            # Selecting the target applied its parameter.json and saved result
-            # settings; the values shown at exit take precedence.
+            # Selecting the target applied its parameter.json; the values
+            # shown at exit take precedence, exactly as they were entered.
             self.apply_settings(self.startup_settings)
+            if isinstance(state.get("values"), dict):
+                self.restore_entered_values(state["values"])
         for tabs, key in ((self.parameter_tabs, "parameter_tab"), (self.openmx_tabs, "openmx_tab")):
             index = state.get(key)
-            if isinstance(index, int) and 0 <= index < tabs.count():
+            if isinstance(index, int) and 0 <= index < tabs.count() and tabs.isTabEnabled(index):
                 tabs.setCurrentIndex(index)
+        display = self.display_type.findData(state.get("display_type"))
+        if display >= 0:
+            self.display_type.blockSignals(True); self.display_type.setCurrentIndex(display)
+            self.display_type.blockSignals(False)
         if isinstance(state.get("geometry"), str):
             self.restoreGeometry(QtCore.QByteArray.fromBase64(state["geometry"].encode("ascii")))
         if self.current_structure is None:
@@ -2092,11 +2541,14 @@ class Window(QtWidgets.QMainWindow):
             if result.get("structure_name") not in (None, name):
                 continue
             result["structure_name"] = name
-            gui = validate_settings(self.settings())
+            try:
+                gui = validate_settings(self.settings())
+            except ValueError:
+                gui = None
             # Display-only edits made after the calculation (Gaussian widths,
             # EF shift, θmax, boundary) are kept; otherwise show the result as
             # it was calculated.
-            display = gui if can_reuse_display(result, gui) else result["s"]
+            display = gui if gui is not None and can_reuse_display(result, gui) else result["s"]
             self.append_log(f"[PAD result restored] {path}")
             self.display_in_background(
                 result, display, state.get("eb") if same_target else None,
@@ -2521,6 +2973,17 @@ class Window(QtWidgets.QMainWindow):
         try: settings=validate_settings(self.settings())
         except ValueError: return
         if can_reuse_display(self.result, settings): self.calculate()
+    def confirm_mesh_calculation(self, settings, plan):
+        """Ask before OpenMX calculates the first-BZ eigenstates; Yes starts it."""
+        name=self.current_structure.name if self.current_structure else DEFAULT_STRUCTURE.name
+        text,details=mesh_confirmation_text(name,core.divisions(settings),plan["count"],core.saved_mesh_points(plan))
+        box=QtWidgets.QMessageBox(self); box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        box.setWindowTitle("Start OpenMX calculation?"); box.setText(text); box.setInformativeText(details)
+        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes|QtWidgets.QMessageBox.StandardButton.No)
+        box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Yes)
+        box.setEscapeButton(QtWidgets.QMessageBox.StandardButton.No)
+        return box.exec()==QtWidgets.QMessageBox.StandardButton.Yes
+
     def calculate(self):
         global LATTICE, B
         if self.thread: return
@@ -2548,15 +3011,11 @@ class Window(QtWidgets.QMainWindow):
             if settings["hv"]+v0-settings["eb_max"] <= 0:
                 raise ValueError("The kinetic energy inside the material is not positive at EB End.")
             plan=core.mesh_plan(settings)
-            if not plan["reuse"]:
-                answer=QtWidgets.QMessageBox.question(self,"First-BZ precomputation",
-                    f"N={core.divisions(settings)}, total {plan['count']:,} k points.\n"
-                    "Completed batches will be reused and missing points calculated by OpenMX.\nThis mesh will then be reused even if PAD conditions change.",
-                    QtWidgets.QMessageBox.StandardButton.Yes |
-                    QtWidgets.QMessageBox.StandardButton.No,
-                    QtWidgets.QMessageBox.StandardButton.No)
-                if answer != QtWidgets.QMessageBox.StandardButton.Yes: return
+            if not plan["reuse"] and not self.confirm_mesh_calculation(settings, plan): return
             self.save_calc_settings(settings)
+        except core.CifError as exc:
+            self.show_error(f"Cannot calculate {self.current_structure.name if self.current_structure else ''}: "
+                            "its CIF has errors", exc); return
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self,"Settings/calculation preparation error",str(exc)); return
         old=self.eb(); self._slider_min=settings["eb_min"]; self._slider_step=settings["de"]
@@ -2591,7 +3050,7 @@ class Window(QtWidgets.QMainWindow):
     def closeEvent(self,event):
         self._stop_eb_sweep()
         try:
-            self.save_structure_settings()
+            if self.save_on_exit: self.save_structure_settings()
         except (OSError, ValueError) as exc:
             self.append_log(f"Could not save PAD parameters on exit: {exc}")
         self.store_session()
@@ -2603,21 +3062,10 @@ class Window(QtWidgets.QMainWindow):
     def update_mesh_result(self, result):
         size = result.get('mesh_bytes') if result else None
         if size is None: return
-        openmx = result.get('openmx_seconds', 0.0)
-        conversion = result.get('conversion_seconds', 0.0)
-        combined = result.get('openmx_hdf5_seconds', openmx + conversion)
-        wall = result.get('mesh_seconds', combined)
-        timing = (f"OpenMX {format_duration(openmx)} / HDF5 conversion {format_duration(conversion)}\n"
-                  f"Total {format_duration(combined)} (wall time {format_duration(wall)})"
-                  if openmx or conversion else f"Cache reused (checked in {format_duration(wall)})")
-        path = Path(result.get('mesh_path', ''))
-        display_name = str(Path(path.parent.name) / path.name) if path.name else 'unknown'
-        lines=[display_name]
-        if openmx or conversion:
-            lines.append(timing)
-        lines.append(format_file_size(size))
-        self.mesh_result.setText("\n".join(lines))
-        self.mesh_result.setToolTip(str(path))
+        # Stored calculation times are shown on every display, including a
+        # reused cache, a restart and an opened result file.
+        self.mesh_result.setText("\n".join(mesh_result_lines(result)))
+        self.mesh_result.setToolTip(str(result.get('mesh_path', '')))
     def partial_result(self,r):
         self.result=r; self.update_mesh_result(r); self.redraw()
     def cleanup(self):
@@ -2647,11 +3095,11 @@ class Window(QtWidgets.QMainWindow):
     def failed(self,text):
         self.message.setText("Calculation failed"); self.progress.setFormat("Calculation failed"); self.append_log(text)
         box=QtWidgets.QMessageBox(self); box.setIcon(QtWidgets.QMessageBox.Icon.Critical); box.setText("Calculation failed"); box.setDetailedText(text); box.exec()
-    def map_bz(self,ax):
+    def map_bz(self,ax,color="w"):
         if not self.show_bz.isChecked(): return
         xlim, ylim = ax.get_xlim(), ax.get_ylim()
         for i,j,poly in repeated_bz_polygons(xlim,ylim):
-            p=np.vstack((poly,poly[0])); ax.plot(p[:,0],p[:,1],"w--",lw=.85,alpha=.8)
+            p=np.vstack((poly,poly[0])); ax.plot(p[:,0],p[:,1],"--",color=color,lw=.85,alpha=.8)
     def line_bz(self,ax,s):
         if not self.show_bz.isChecked(): return
         xlim=ax.get_xlim()
@@ -2681,8 +3129,9 @@ class Window(QtWidgets.QMainWindow):
 
     @staticmethod
     def map_title(name, eb_display):
-        """Title of the kx-ky map of the band weight ('band_weight') or the PAD."""
-        prefix = "Band Slice " if name == "band_weight" else "PAD: "
+        """Title of the kx-ky map of the band weight ('band_weight'), the band
+        contours ('contours') or the PAD."""
+        prefix = {"band_weight": "Band Slice ", "contours": "Band Diagram "}.get(name, "PAD: ")
         return f"{prefix}EB′={eb_display:g} eV"
 
     def update_eb_view(self):
@@ -2700,10 +3149,16 @@ class Window(QtWidgets.QMainWindow):
             self.redraw(); return
         eb_display=eb+s.get('ef_shift',0.0)
         for item in view['maps']:
-            values=self.eb_map_values(s,eb,data,item['name'],view['axis'])
-            item['image'].set_data(values)
-            top=float(np.nanmax(values)) if np.isfinite(values).any() else 0.0
-            item['image'].set_clim(0,top if top>0 else 1.0)  # as imshow(vmin=0) autoscales
+            if item['name']=='contours':
+                segments=contour_segments(r.get('contours'),eb)
+                if segments is None:
+                    self.redraw(); return
+                self.update_contour_lines(item['artist'],segments,s,eb,data,view['axis'])
+            else:
+                values=self.eb_map_values(s,eb,data,item['name'],view['axis'])
+                item['artist'].set_data(values)
+                top=float(np.nanmax(values)) if np.isfinite(values).any() else 0.0
+                item['artist'].set_clim(0,top if top>0 else 1.0)  # as imshow(vmin=0) autoscales
             item['ax'].set_title(self.map_title(item['name'],eb_display))
         for line in view['lines']:
             line.set_ydata([eb_display,eb_display])
@@ -2723,6 +3178,137 @@ class Window(QtWidgets.QMainWindow):
         self._eb_background=self.canvas.copy_from_bbox(fig.bbox)
         for artist in view['animated']: fig.draw_artist(artist)
 
+    def update_contour_lines(self, collection, segments, s, eb, data, axis):
+        """Set the band contours of one EB, coloured by the PAD map of that EB."""
+        pad=(self.eb_map_values(s,eb,data,'pad',axis) if data is not None
+             else np.full((len(axis),len(axis)),np.nan))
+        values,value_range=pad_colored_contours(segments,pad,axis)
+        collection.set_segments(segments); collection.set_array(values)
+        collection.set_clim(*pad_band_limits(value_range))
+
+    def draw_eb_map(self, fig, ax, name, s, eb, eb_display, data, axis, box):
+        """kx-ky map of the band weight or the PAD at the selected EB."""
+        cmap,label={'band_weight':('viridis','Band weight'),'pad':('inferno','PAD')}[name]
+        extent=(axis[0],axis[-1],axis[0],axis[-1])
+        item=dict(ax=ax,name=name,artist=None,colorbar=None)
+        if data is not None:
+            values=self.eb_map_values(s,eb,data,name,axis)
+            im=ax.imshow(values,origin='lower',extent=extent,cmap=cmap,aspect='equal',vmin=0)
+            item['artist']=im; item['colorbar']=panel_colorbar(fig,im,ax,label)
+        else:
+            ax.set_box_aspect(box)
+            ax.text(.5,.5,'Waiting for this EB slice',ha='center',transform=ax.transAxes)
+        ax.set(xlim=extent[:2],ylim=extent[2:],xlabel='kx (Å⁻¹)',ylabel='ky (Å⁻¹)',
+               title=self.map_title(name,eb_display))
+        self.map_bz(ax)
+        return item
+
+    def draw_contour_map(self, fig, ax, r, eb, eb_display, data, axis):
+        """Bands crossing the PAD map at the selected EB (on the photoemission
+        sphere), coloured (rainbow) by the PAD there; see sphere_band_contours()."""
+        s=r['s']; extent=(axis[0],axis[-1],axis[0],axis[-1])
+        item=dict(ax=ax,name='contours',artist=None,colorbar=None)
+        segments=contour_segments(r.get('contours'),eb)
+        if segments is not None:
+            collection=LineCollection(np.zeros((0,2,2)),cmap=PAD_BAND_CMAP,linewidths=1.0)
+            self.update_contour_lines(collection,segments,s,eb,data,axis)
+            ax.add_collection(collection)
+            item['artist']=collection; item['colorbar']=panel_colorbar(fig,collection,ax,'PAD')
+        else:
+            text=('Band contours are not in this result (k-space HDF5 not found)'
+                  if r.get('contours') is None else 'Waiting for this EB slice')
+            ax.text(.5,.5,text,ha='center',transform=ax.transAxes,wrap=True)
+        ax.set_aspect('equal')
+        ax.set(xlim=extent[:2],ylim=extent[2:],xlabel='kx (Å⁻¹)',ylabel='ky (Å⁻¹)',
+               title=self.map_title('contours',eb_display))
+        self.map_bz(ax,color='0.45')
+        return item
+
+    def draw_slice(self, fig, ax, key, r, axis, eb_display):
+        """Band weight or PAD along the slice versus EB; returns the EB marker."""
+        s=r['s']; shift=s.get('ef_shift',0.0); cuts=r['cuts']
+        ebs=energies(s); display_ebs=np.asarray(ebs)+shift
+        cmap,label,name={'band_weight':('viridis','Band weight','Band'),'pad':('inferno','PAD','PAD')}[key]
+        im=None; title=f"{name} Slice {s['direction']}-EB"
+        if s['direction']=='kz':
+            ordered=[cuts[e] for e in sorted(cuts)]
+            if ordered:
+                k=np.concatenate([c['k'] for c in ordered]); val=np.concatenate([c[key] for c in ordered])
+                energy=np.array([c['eb']+shift for c in ordered]); valid=np.isfinite(val)
+                if valid.any(): im=ax.scatter(k[valid],energy[valid],c=val[valid],cmap=cmap,s=18,vmin=0)
+        else:
+            values=np.full((len(ebs),len(axis)),np.nan)
+            for i,e in enumerate(ebs):
+                if e in cuts: values[i]=cuts[e][key]
+            if np.isfinite(values).any(): im=ax.pcolormesh(axis,display_ebs,values,shading='auto',cmap=cmap,vmin=0)
+            ax.set_xlim(axis[0],axis[-1])
+        if im is not None: panel_colorbar(fig,im,ax,label)
+        else: ax.text(.5,.5,'No completed / visible points',ha='center',transform=ax.transAxes)
+        # EF shift moves the spectra inside a fixed requested display
+        # window.  Moving these limits by the same amount made the shift
+        # cancel visually even though the energy coordinates had changed.
+        ax.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
+               ylabel='EB′ = EB + EF shift (eV)',title=title)
+        marker=ax.axhline(eb_display,color='cyan',ls='--'); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
+        return marker
+
+    def draw_pad_cut(self, fig, ax, r, axis, eb_display):
+        """Band diagram along the PAD slice; returns the EB marker.
+
+        Bands at the k points the PAD slice samples (kz on the photoemission
+        sphere at each EB), see pad_cut_bands().  Each band is coloured
+        (rainbow) by the PAD at its position, scaled from the minimum to the
+        maximum PAD of the slice; grey where the slice has no PAD (outside the
+        photoemission horizon or not yet calculated).
+        """
+        s=r['s']; shift=s.get('ef_shift',0.0); cuts=r['cuts']
+        line=r.get('line') or {}
+        if line.get('path')==PAD_SLICE_PATH:
+            colored=pad_colored_bands(line,cuts,s)
+            band_norm=matplotlib.colors.Normalize(*pad_band_limits(colored['range']))
+            def band_colors(values):
+                return PAD_BAND_CMAP(band_norm(np.ma.masked_invalid(values)))
+            segments=colored['segments'].copy(); segments[...,1]+=shift
+            if len(segments):
+                ax.add_collection(LineCollection(
+                    segments,colors=band_colors(colored['segment_values']),
+                    linewidths=np.where(np.isnan(colored['segment_values']),.6,1.2)))
+            points=colored['points']
+            if len(points):
+                ax.scatter(points[:,0],points[:,1]+shift,c=band_colors(colored['point_values']),s=6)
+            if np.isfinite(colored['range'][0]):
+                panel_colorbar(fig,matplotlib.cm.ScalarMappable(norm=band_norm,cmap=PAD_BAND_CMAP),ax,'PAD')
+        else:
+            # A band cut from an earlier version (fixed kz): plain lines.
+            if line.get('k') is not None and line.get('bands') is not None:
+                for band in np.asarray(line['bands']).T: ax.plot(line['k'],-band+shift,'k',lw=.8)
+            points=np.asarray(line.get('points',np.zeros((0,2))),dtype=float).reshape(-1,2)
+            if len(points): ax.plot(points[:,0],-points[:,1]+shift,'k.',ms=2)
+        if s['direction']!='kz': ax.set_xlim(axis[0],axis[-1])
+        ax.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
+               ylabel='EB′ = EB + EF shift (eV)',title='Band Diagram (PAD cut)')
+        marker=ax.axhline(eb_display,color='red',ls='--'); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
+        return marker
+
+    def draw_trajectories(self, fig, ax, r, axis):
+        """kx-kz photoelectron trajectories on the photoemission spheres."""
+        s=r['s']; shift=s.get('ef_shift',0.0); ebs=energies(s)
+        kx=np.linspace(axis[0],axis[-1],401)
+        norm=matplotlib.colors.Normalize(s['eb_min'],s['eb_max']); cmap=matplotlib.colormaps['turbo']
+        for e in np.linspace(s['eb_min'],s['eb_max'],min(41,len(ebs))):
+            z2=(s['hv']+r['v0']-e)/H2M-kx*kx; valid=z2>=0
+            ax.plot(kx[valid],np.sqrt(z2[valid]),color=cmap(norm(e+shift)))
+        kz_max=math.sqrt(max((s['hv']+r['v0']-s['eb_min'])/H2M,0.0))*1.04
+        if self.show_bz.isChecked():
+            kx_bounds,kz_bounds=trajectory_bz_boundaries((axis[0],axis[-1]),kz_max)
+            for boundary in kx_bounds:
+                ax.axvline(boundary,color='.35',ls='--',lw=.7,alpha=.8)
+            for boundary in kz_bounds:
+                ax.axhline(boundary,color='.35',ls='--',lw=.7,alpha=.8)
+        panel_colorbar(fig,matplotlib.cm.ScalarMappable(norm=norm,cmap=cmap),ax,'EB′ = EB + EF shift (eV)')
+        ax.set(xlim=(axis[0],axis[-1]),ylim=(0,max(kz_max,1e-6)),
+               xlabel='kx (Å⁻¹)',ylabel='kz (Å⁻¹)',title='kx-kz photoelectron trajectories')
+
     def redraw(self):
         self._eb_artists=None; self._eb_background=None
         if self.result is None: return
@@ -2731,71 +3317,40 @@ class Window(QtWidgets.QMainWindow):
             return
         s=r['s']; shift=s.get('ef_shift',0.0)
         eb=round(self.eb(),8); eb_display=eb+shift; data=r['maps'].get(eb)
-        fig=self.canvas.figure; fig.clear(); axes=fig.subplots(3,2).ravel()
-        a0,a1,a2,a3,a4,a5=axes
+        normal=self.display_type.currentData()=='normal'
+        if normal and r.get('contours') is None:
+            ensure_band_contours(r)  # a result saved before the contours were kept
+        fig=self.canvas.figure; fig.clear()
         axis=cartesian_axis(s); extent=(axis[0],axis[-1],axis[0],axis[-1])
+        # Every panel has the box of the kx-ky maps at the top, right-aligned
+        # next to its colour bar, so all panels are as wide as the top slices.
+        box=abs(extent[3]-extent[2])/abs(extent[1]-extent[0])
+        axes=fig.subplots(2,2).ravel() if normal else fig.subplots(3,2).ravel()
+        for ax in axes: ax.set_anchor((1.0,0.5))
         maps=[]; lines=[]
-        for ax,name,cmap,title in ((a0,'band_weight','viridis','Band weight'),(a1,'pad','inferno','PAD')):
-            item=dict(ax=ax,name=name,title=title,image=None,colorbar=None); maps.append(item)
-            if data is not None:
-                values=self.eb_map_values(s,eb,data,name,axis)
-                im=ax.imshow(values,origin='lower',extent=extent,cmap=cmap,aspect='equal',vmin=0)
-                item['image']=im; item['colorbar']=fig.colorbar(im,ax=ax,label=title)
-            else:
-                ax.text(.5,.5,'Waiting for this EB slice',ha='center',transform=ax.transAxes)
-            ax.set(xlim=extent[:2],ylim=extent[2:],xlabel='kx (Å⁻¹)',ylabel='ky (Å⁻¹)',
-                   title=self.map_title(name,eb_display))
-            self.map_bz(ax)
-        ebs=energies(s); display_ebs=np.asarray(ebs)+shift; cuts=r['cuts']
-        for ax,key,cmap,label,name in ((a2,'band_weight','viridis','Band weight','Band'),(a3,'pad','inferno','PAD','PAD')):
-            im=None; title=f"{name} Slice {s['direction']}-EB"
-            if s['direction']=='kz':
-                ordered=[cuts[e] for e in sorted(cuts)]
-                if ordered:
-                    k=np.concatenate([c['k'] for c in ordered]); val=np.concatenate([c[key] for c in ordered])
-                    energy=np.array([c['eb']+shift for c in ordered]); valid=np.isfinite(val)
-                    if valid.any(): im=ax.scatter(k[valid],energy[valid],c=val[valid],cmap=cmap,s=18,vmin=0)
-            else:
-                values=np.full((len(ebs),len(axis)),np.nan)
-                for i,e in enumerate(ebs):
-                    if e in cuts: values[i]=cuts[e][key]
-                if np.isfinite(values).any(): im=ax.pcolormesh(axis,display_ebs,values,shading='auto',cmap=cmap,vmin=0)
-                ax.set_xlim(axis[0],axis[-1])
-            if im is not None: fig.colorbar(im,ax=ax,label=label)
-            else: ax.text(.5,.5,'No completed / visible points',ha='center',transform=ax.transAxes)
-            # EF shift moves the spectra inside a fixed requested display
-            # window.  Moving these limits by the same amount made the shift
-            # cancel visually even though the energy coordinates had changed.
-            ax.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
-                   ylabel='EB′ = EB + EF shift (eV)',title=title)
-            lines.append(ax.axhline(eb_display,color='cyan',ls='--')); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
-        # Bands at the k points the PAD slice samples (kz on the
-        # photoemission sphere at each EB), see pad_cut_bands().
-        line=r.get('line') or {}
-        if line.get('k') is not None and line.get('bands') is not None:
-            for band in np.asarray(line['bands']).T: a4.plot(line['k'],-band+shift,'k',lw=.8)
-        points=np.asarray(line.get('points',np.zeros((0,2))),dtype=float).reshape(-1,2)
-        if len(points): a4.plot(points[:,0],-points[:,1]+shift,'k.',ms=2)
-        if s['direction']!='kz': a4.set_xlim(axis[0],axis[-1])
-        a4.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
-               ylabel='EB′ = EB + EF shift (eV)',title='Band Diagram (PAD cut)')
-        lines.append(a4.axhline(eb_display,color='red',ls='--')); self.add_ek_axis(a4,s,r['v0']); self.line_bz(a4,s)
-        kx=np.linspace(axis[0],axis[-1],401)
-        norm=matplotlib.colors.Normalize(s['eb_min'],s['eb_max']); cmap=matplotlib.colormaps['turbo']
-        for e in np.linspace(s['eb_min'],s['eb_max'],min(41,len(ebs))):
-            z2=(s['hv']+r['v0']-e)/H2M-kx*kx; valid=z2>=0
-            a5.plot(kx[valid],np.sqrt(z2[valid]),color=cmap(norm(e+shift)))
-        kz_max=math.sqrt(max((s['hv']+r['v0']-s['eb_min'])/H2M,0.0))*1.04
-        if self.show_bz.isChecked():
-            kx_bounds,kz_bounds=trajectory_bz_boundaries((axis[0],axis[-1]),kz_max)
-            for boundary in kx_bounds:
-                a5.axvline(boundary,color='.35',ls='--',lw=.7,alpha=.8)
-            for boundary in kz_bounds:
-                a5.axhline(boundary,color='.35',ls='--',lw=.7,alpha=.8)
-        fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm,cmap=cmap),ax=a5,label='EB′ = EB + EF shift (eV)')
-        a5.set(xlim=(axis[0],axis[-1]),ylim=(0,max(kz_max,1e-6)),
-               xlabel='kx (Å⁻¹)',ylabel='kz (Å⁻¹)',title='kx-kz photoelectron trajectories')
-        if all(item['image'] is not None for item in maps):
+        if normal:
+            # Band contours | PAD at EB; band diagram | PAD along the slice.
+            a_bands,a_pad,a_cut,a_slice=axes
+            for ax in (a_cut,a_slice): ax.set_box_aspect(box)
+            maps.append(self.draw_contour_map(fig,a_bands,r,eb,eb_display,data,axis))
+            maps.append(self.draw_eb_map(fig,a_pad,'pad',s,eb,eb_display,data,axis,box))
+            lines.append(self.draw_pad_cut(fig,a_cut,r,axis,eb_display))
+            lines.append(self.draw_slice(fig,a_slice,'pad',r,axis,eb_display))
+            # Square panels are usually narrower than the cells: keep the two
+            # rows together in the middle instead of spreading them apart (set
+            # after the colour bars, which anchor their panel to the right).
+            for ax in (a_bands,a_pad): ax.set_anchor((1.0,0.0))
+            for ax in (a_cut,a_slice): ax.set_anchor((1.0,1.0))
+        else:
+            a0,a1,a2,a3,a4,a5=axes
+            for ax in (a2,a3,a4,a5): ax.set_box_aspect(box)
+            maps.append(self.draw_eb_map(fig,a0,'band_weight',s,eb,eb_display,data,axis,box))
+            maps.append(self.draw_eb_map(fig,a1,'pad',s,eb,eb_display,data,axis,box))
+            lines.append(self.draw_slice(fig,a2,'band_weight',r,axis,eb_display))
+            lines.append(self.draw_slice(fig,a3,'pad',r,axis,eb_display))
+            lines.append(self.draw_pad_cut(fig,a4,r,axis,eb_display))
+            self.draw_trajectories(fig,a5,r,axis)
+        if data is not None and all(item['artist'] is not None for item in maps):
             animated=[a for item in maps for a in (item['ax'],item['colorbar'].ax)]+lines
             for artist in animated: artist.set_animated(True)
             self._eb_artists=dict(result=r,maps=maps,lines=lines,animated=animated,axis=axis)
@@ -3150,7 +3705,8 @@ def main():
     set_data_folder(data_folder)
     window=Window(settings, session=True); window.show()
     if args.smoke_test:
-        window.persist_session=False  # check the restore path without saving
+        # Check the restore path without saving the session or parameters.
+        window.persist_session=False; window.save_on_exit=False
         QtCore.QTimer.singleShot(500,window.close)
     sys.exit(app.exec())
 
