@@ -200,7 +200,7 @@ Below the OpenMX tabs, the settings are split into the `PAD` and `Band Diagram` 
 - `PAD calculation`: `C++ batch` or the comparison `Python per EB (comparison)` backend
 - `hν`: photon energy
 - `Polarization`: `lx`, `ly`, `c+`, `c-`, or `unpolarized`
-- `Incident Angles (zyz Euler)`: Euler angles a, b, c (z-y-z rotation) of the incident light (a and c: −360 to 360°, b: 0 to 180°). Press the `Incident Angles (zyz Euler, °)…` button to choose a beamline preset (SPring-8 BL25SU: 0, 90, −90; UVSOR PMM: 0, 68, −90) and apply it with OK
+- `Incident Angles (zyz Euler)`: Euler angles a, b, c (z-y-z rotation) of the incident light (a and c: −360 to 360°, b: 0 to 180°). Press the `Incident Angles (zyz Euler, °)…` button to choose a beamline preset (SPring-8 BL25SU: 0, 90, −90; UVSOR PMM: 0, 68, −90) and apply it with OK. SPring-8 BL25SU also sets `wfnc` to 4.4 eV; UVSOR PMM leaves `wfnc` unchanged
 - `EF shift`: display-only Fermi-level shift
 - `V0`: inner potential; `V0 <= 0` uses the automatic setting
 - `wfnc`: photoelectron wavefunction parameter
@@ -219,6 +219,8 @@ Changing PAD conditions reuses the first-Brillouin-zone eigenstate cache.
 The `Band Diagram` tab is reserved for band-diagram settings that are not implemented yet, so it is disabled in this version. It holds only the second fixed coordinate, which keeps the value saved in `parameter.json` (or in an opened result file); the first one is in the `PAD` tab under `Slice direction`. The fixed coordinates of the slice chosen with `Slice direction` are as follows. For a `kx` slice, `ky fixed` (`PAD` tab) sets ky; kz is not fixed but follows the photoemission sphere at each EB, kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²), so `kz fixed` is not used (likewise for a `ky` slice, with `kx fixed`). `Slice direction` offers only `kx` and `ky`; settings with a `kz` slice saved by an earlier version open as `kx`, and result files with a `kz` slice are still displayed.
 
 Choose the figure layout with `Display type` above `Calc` (no recalculation needed).
+
+Choose the EB shown with the slider or with `Current EB′` under `Calc`. A typed value is applied when you press Enter; the up/down buttons, the arrow keys and the mouse wheel move by `EB Step` and update the figure at once. `▶ Play` shows every EB from `EB Begin` to `EB End`.
 
 | Display type | Panels |
 |---|---|

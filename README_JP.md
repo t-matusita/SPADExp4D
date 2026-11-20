@@ -200,7 +200,7 @@ OpenMXのタブより下の設定は、`PAD`タブと`Band Diagram`タブに分�
 - `PAD calculation`：`C++ batch`または比較用の`Python per EB (comparison)`
 - `hν`：光子エネルギー
 - `Polarization`：`lx`、`ly`、`c+`、`c-`、`unpolarized`
-- `Incident Angles (zyz Euler)`：入射光のEuler角a, b, c（z-y-z回転）。a・cは−360〜360°、bは0〜180°です。`Incident Angles (zyz Euler, °)…`ボタンを押すとビームラインのプリセット（SPring-8 BL25SU：0, 90, −90、UVSOR PMM：0, 68, −90）を選べ、OKで値が入ります
+- `Incident Angles (zyz Euler)`：入射光のEuler角a, b, c（z-y-z回転）。a・cは−360〜360°、bは0〜180°です。`Incident Angles (zyz Euler, °)…`ボタンを押すとビームラインのプリセット（SPring-8 BL25SU：0, 90, −90、UVSOR PMM：0, 68, −90）を選べ、OKで値が入ります。SPring-8 BL25SUを選ぶと`wfnc`も4.4 eVになります（UVSOR PMMでは`wfnc`は変わりません）
 - `EF shift`：表示時のFermi準位シフト
 - `V0`：物質内部ポテンシャル。`V0 <= 0`では自動設定を使用します
 - `wfnc`：光電子波動関数のパラメーター
@@ -219,6 +219,8 @@ PAD計算条件を変更しても、第一BZの固有状態キャッシュは再
 `Band Diagram`タブはバンド図の設定用で、まだ実装していないため、このバージョンでは選択できません（無効）。このタブにあるのは2つ目の固定座標だけで、`parameter.json`（または開いた結果ファイル）に保存された値のままになります。1つ目の固定座標は`PAD`タブの`Slice direction`の下で入力します。`Slice direction`で選んだスライスの固定座標は次のとおりです。`kx`スライスでは`ky fixed`（`PAD`タブ）でkyを指定します。kzは固定ではなく、各EBで光電子の球面 kz = √((hν + V0 − EB)/(ħ²/2m) − kx² − ky²) に従うため、`kz fixed`は使いません（`ky`スライスも同様で、`kx fixed`を指定します）。`Slice direction`で選べるのは`kx`と`ky`だけです。以前のバージョンで保存した`kz`スライスの設定は`kx`として開き、`kz`スライスの結果ファイルはそのまま表示できます。
 
 図の並びは、`Calc`の上の`Display type`で選びます（計算し直す必要はありません）。
+
+表示するEBは、`Calc`の下のスライダーか`Current EB′`で選びます。数値を入力したときはEnterで確定します。上下ボタン・矢印キー・マウスホイールでは`EB Step`ずつ変わり、図もすぐに切り替わります。`▶ Play`を押すと、`EB Begin`から`EB End`まで順に表示します。
 
 | Display type | 図 |
 |---|---|

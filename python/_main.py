@@ -95,6 +95,10 @@ EULER_PRESETS = (
     ("SPring-8 BL25SU", (0.0, 90.0, -90.0)),
     ("UVSOR PMM", (0.0, 68.0, -90.0)),
 )
+# Other parameters a beamline preset sets together with the angles.
+PRESET_SETTINGS = {
+    "SPring-8 BL25SU": {"wfnc": 4.4},  # work function (eV)
+}
 
 DEFAULT_SETTINGS = {
     "hv": 21.2, "v0": 20.0, "ef_shift": 0.0, "wfnc": 4.0,
@@ -1733,6 +1737,16 @@ class DisplayRelay(QtCore.QObject):
     ready = QtCore.pyqtSignal(int, object, object)  # job, display result, error text
 
 
+class StepSpinBox(QtWidgets.QDoubleSpinBox):
+    """Double spin box that reports each up/down step (arrow buttons, arrow and
+    Page keys, mouse wheel) with `stepped`; typed text is not reported."""
+    stepped = QtCore.pyqtSignal()
+
+    def stepBy(self, steps):
+        super().stepBy(steps)
+        self.stepped.emit()
+
+
 class FitScrollArea(QtWidgets.QScrollArea):
     """A vertical scroll area no taller than its contents.
 
@@ -1782,8 +1796,8 @@ class Window(QtWidgets.QMainWindow):
         self.current_structure = None; self.build(); self.direction_changed()
         if session:
             self.restore_session()
-    def spin(self, value, lo=-100, hi=100):
-        x=QtWidgets.QDoubleSpinBox(); x.setRange(lo,hi); x.setDecimals(3); x.setValue(value); x.setSingleStep(.1); return x
+    def spin(self, value, lo=-100, hi=100, cls=QtWidgets.QDoubleSpinBox):
+        x=cls(); x.setRange(lo,hi); x.setDecimals(3); x.setValue(value); x.setSingleStep(.1); return x
     def build(self):
         initial = self.initial_settings
         ensure_app_folders()
@@ -1884,7 +1898,8 @@ class Window(QtWidgets.QMainWindow):
         self.alpha=self.spin(initial["alpha"],-360,360); self.beta=self.spin(initial["beta"],0,180); self.gamma=self.spin(initial["gamma"],-360,360)
         self.euler_button=QtWidgets.QPushButton("Incident Angles (zyz Euler, °)…")
         self.euler_button.setToolTip("Euler angles a, b, c (z-y-z) of the incident light. "
-                                     "Press to choose a beamline preset; the values stay editable.")
+                                     "Press to choose a beamline preset, which may also set wfnc; "
+                                     "the values stay editable.")
         self.euler_button.clicked.connect(self.choose_euler_preset)
         self.euler_button.setMinimumWidth(self.euler_button.sizeHint().width())  # never clip the text
         self.dk=self.spin(initial["dk"],0,100); self.dE=self.spin(initial["dE"],0,100)
@@ -1947,12 +1962,15 @@ class Window(QtWidgets.QMainWindow):
         self._slider_min=initial["eb_min"]; self._slider_step=initial["de"]
         self.slider=QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); self.slider.setRange(0,int(round((initial["eb_max"]-initial["eb_min"])/initial["de"]))); self.slider.valueChanged.connect(self.slider_changed)
         shift=initial["ef_shift"]
-        self.eb_input=self.spin(initial["eb_min"]+shift,initial["eb_min"]+shift,initial["eb_max"]+shift)
+        self.eb_input=self.spin(initial["eb_min"]+shift,initial["eb_min"]+shift,initial["eb_max"]+shift,
+                                cls=StepSpinBox)
         self.eb_input.setSingleStep(initial["de"])
-        # Do not commit every intermediate text/valueChanged event.  An EB
-        # selection is accepted only when the user presses Enter.
+        # Do not commit every intermediate text/valueChanged event: a typed EB
+        # is accepted when the user presses Enter.  Up/down steps (buttons,
+        # arrow keys, wheel) move by EB Step and are shown at once.
         self.eb_input.setKeyboardTracking(False)
         self.eb_input.lineEdit().returnPressed.connect(self.eb_input_changed)
+        self.eb_input.stepped.connect(self.eb_input_changed)
         self.ef_shift.valueChanged.connect(self.ef_shift_changed)
         self.play_eb_button=QtWidgets.QPushButton("▶ Play")
         self.play_eb_button.setToolTip("Display EB from Begin to End every 250 ms")
@@ -2716,7 +2734,8 @@ class Window(QtWidgets.QMainWindow):
         return tuple(box.value() for box in (self.alpha, self.beta, self.gamma))
 
     def choose_euler_preset(self):
-        """Set the incident angles (Euler a, b, c) from the beamline chosen in EulerPresetDialog."""
+        """Set the incident angles (Euler a, b, c) from the beamline chosen in
+        EulerPresetDialog, and the other parameters of that beamline (wfnc)."""
         dialog = EulerPresetDialog(self.euler_angles(), self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
@@ -2724,6 +2743,9 @@ class Window(QtWidgets.QMainWindow):
         if angles is not None:
             for box, value in zip((self.alpha, self.beta, self.gamma), angles):
                 box.setValue(value)
+            boxes = {"wfnc": self.wfnc}
+            for key, value in dialog.extra_settings().items():
+                boxes[key].setValue(value)
 
     def show_preferences(self):
         dialog = PreferencesDialog(STRUCTURES, self)
@@ -3531,8 +3553,11 @@ def prompt_for_data_folder(missing, parent=None):
             return selected
 
 
-def format_euler(angles):
-    return ", ".join(f"{name} = {value:g}°" for name, value in zip("abc", angles))
+def format_euler(angles, extra=None):
+    text = ", ".join(f"{name} = {value:g}°" for name, value in zip("abc", angles))
+    if extra and "wfnc" in extra:
+        text += f"; wfnc = {extra['wfnc']:g} eV"
+    return text
 
 
 class EulerPresetDialog(QtWidgets.QDialog):
@@ -3546,7 +3571,7 @@ class EulerPresetDialog(QtWidgets.QDialog):
         for name, angles in EULER_PRESETS:
             item = QtWidgets.QListWidgetItem(name)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, angles)
-            item.setToolTip(format_euler(angles))
+            item.setToolTip(format_euler(angles, PRESET_SETTINGS.get(name)))
             self.list.addItem(item)
         self.list.setMinimumHeight(self.list.sizeHintForRow(0) * (len(EULER_PRESETS) + 1))
         self.detail = QtWidgets.QLabel()
@@ -3571,13 +3596,18 @@ class EulerPresetDialog(QtWidgets.QDialog):
     def selection_changed(self, *_):
         angles = self.angles()
         self.ok_button.setEnabled(angles is not None)
-        self.detail.setText("" if angles is None else format_euler(angles))
+        self.detail.setText("" if angles is None else format_euler(angles, self.extra_settings()))
 
     def angles(self):
         item = self.list.currentItem()
         if item is None:
             return None
         return tuple(float(value) for value in item.data(QtCore.Qt.ItemDataRole.UserRole))
+
+    def extra_settings(self):
+        """Parameters other than the angles that the chosen beamline sets (wfnc)."""
+        item = self.list.currentItem()
+        return {} if item is None else dict(PRESET_SETTINGS.get(item.text(), {}))
 
 
 class PreferencesDialog(QtWidgets.QDialog):
