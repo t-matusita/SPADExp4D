@@ -1413,6 +1413,9 @@ SPHERE_CONTOUR_METHOD = ('EB + E_n(kx, ky, kz(EB)) = 0 contours on the photoemis
                          'periodic trilinear interpolation of eigenvalues')
 # Bands coloured by PAD: rainbow, grey where there is no PAD.
 PAD_BAND_CMAP = matplotlib.colormaps['rainbow'].with_extremes(bad=(.75, .75, .75, 1.0))
+# Thin red dotted line: the current EB in Band Diagram (PAD cut) and the PAD
+# slice position in Band Diagram EB′.
+RED_DOTTED = dict(color='red', ls=':', lw=1.0, zorder=5)  # above bands and BZ lines
 
 
 def sphere_band_contours(grid, s, v0, stop=None):
@@ -3222,7 +3225,17 @@ class Window(QtWidgets.QMainWindow):
         ax.set(xlim=extent[:2],ylim=extent[2:],xlabel='kx (Å⁻¹)',ylabel='ky (Å⁻¹)',
                title=self.map_title('contours',eb_display))
         self.map_bz(ax,color='0.45')
+        self.slice_position(ax,s)
         return item
+
+    @staticmethod
+    def slice_position(ax, s):
+        """Mark where the PAD slice runs on a kx-ky map: ky = ky fixed for a kx
+        slice (horizontal line), kx = kx fixed for a ky slice (vertical line)."""
+        if s['direction']=='kx': return ax.axhline(s['a'],**RED_DOTTED)
+        if s['direction']=='ky': return ax.axvline(s['a'],**RED_DOTTED)
+        # A kz slice from an earlier version is a single (kx, ky) point.
+        return ax.plot([s['a']],[s['b']],marker='+',ms=8,color=RED_DOTTED['color'],ls='none')[0]
 
     def draw_slice(self, fig, ax, key, r, axis, eb_display):
         """Band weight or PAD along the slice versus EB; returns the EB marker."""
@@ -3287,7 +3300,7 @@ class Window(QtWidgets.QMainWindow):
         if s['direction']!='kz': ax.set_xlim(axis[0],axis[-1])
         ax.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
                ylabel='EB′ = EB + EF shift (eV)',title='Band Diagram (PAD cut)')
-        marker=ax.axhline(eb_display,color='red',ls='--'); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
+        marker=ax.axhline(eb_display,**RED_DOTTED); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
         return marker
 
     def draw_trajectories(self, fig, ax, r, axis):
