@@ -883,6 +883,72 @@ def expected_lcao_paths(file):
     return sorted(expected)
 
 
+ORBITAL_L = {'s': 0, 'p': 1, 'd': 2, 'f': 3}
+
+
+def pao_valence_shells(pao, data_root=None):
+    """Lowest principal quantum number of each l in a PAO file (pseudo.NandL).
+
+    E.g. {0: 3, 1: 3, 2: 3} for Si7.0, {0: 5, 1: 5, 2: 5, 3: 4} for Ce8.0 and
+    a 2p entry for the Si…_2p bases.  Empty when the file is not found.
+    """
+    path = Path(DATA if data_root is None else data_root) / 'PAO' / f'{pao}.pao'
+    try:
+        text = path.read_text(errors='replace')
+    except OSError:
+        return {}
+    block = re.search(r'<pseudo\.NandL(.*?)pseudo\.NandL>', text, re.S)
+    lowest = {}
+    for line in (block.group(1).splitlines() if block else ()):
+        parts = line.split()
+        try:
+            n, l = int(parts[1]), int(parts[2])
+        except (IndexError, ValueError):
+            continue
+        lowest[l] = min(n, lowest.get(l, n))
+    return lowest
+
+
+def orbital_components(file, data_root=None):
+    """Orbital components of the LCAO coefficients in an eigenstate file.
+
+    One component per species and OpenMX radial orbital (s0, s1, p0, …),
+    over all atoms of that species and all m (and spin) parts.  OpenMX orders
+    the radial orbitals of one l by energy, so orbital r of l is labelled
+    n0 + r, n0 being the lowest n of that l in the species' PAO file
+    (pseudo.NandL): Si7.0 s0 = 3s and s1 = 4s, Si7.0_2p p0 = 2p, Ce8.0
+    f0 = 4f.  Without the PAO file the label keeps the OpenMX name (Si s0).
+
+    Returns dicts with 'key' ("<species> <orbital>"), 'label' ("Si 3s (s0)"),
+    'species', 'orbital', 'atoms' (1-based) and 'paths': the LCAO datasets
+    for each spin set suffix ('' or 'Up' and 'Dn').
+    """
+    def text(value):
+        return value.decode() if isinstance(value, (bytes, np.bytes_)) else str(value)
+    species = file['Input/Atomic.Species']
+    labels = [text(v) for v in species['Labels'][:]]
+    orbits = dict(zip(labels, (text(v) for v in species['Orbits'][:])))
+    paos = dict(zip(labels, (text(v) for v in species['PAOs'][:]))) if 'PAOs' in species else {}
+    atom_labels = [text(v) for v in file['Input/Atoms.SpeciesAndCoordinates/Labels'][:]]
+    suffixes = ('Up', 'Dn') if spin_of(file) == 'on' else ('',)
+    components = []
+    for label in labels:
+        atoms = [i for i, name in enumerate(atom_labels, 1) if name == label]
+        if not atoms:
+            continue
+        shells = pao_valence_shells(paos[label], data_root) if label in paos else {}
+        for kind, count in re.findall(r'([spdf])(\d+)', orbits[label]):
+            l = ORBITAL_L[kind]
+            for radial in range(int(count)):
+                orbital = f'{kind}{radial}'
+                name = f'{label} {shells[l] + radial}{kind} ({orbital})' if l in shells else f'{label} {orbital}'
+                paths = {suffix: [f'Output/LCAO/{atom}_{label}/{orbital}{suffix}' for atom in atoms]
+                         for suffix in suffixes}
+                components.append(dict(key=f'{label} {orbital}', label=name, species=label,
+                                       orbital=orbital, atoms=atoms, paths=paths))
+    return components
+
+
 def states_ok(file, count, compressed=False, band_range=None, spin=None):
     """Check a converted or cached eigenstate file.
 
@@ -1472,6 +1538,47 @@ class EigenstateGrid:
             indices = np.ravel_multi_index(((lower + offset) % self.ns).T, tuple(self.ns))
             weight = np.prod(np.where(offset, fraction, 1.0-fraction), axis=1)
             values += weight[:, None] * table[indices]
+        return values
+
+    def component_table(self, components, columns, rows=8192):
+        """Σ|c|² of the orbital components (orbital_components()) at every
+        mesh point for the band-table columns `columns` (mesh points × columns).
+
+        Sums all atoms, m and spin parts (real and imaginary) of each
+        component; for collinear spin the first band set reads the Up
+        coefficients and the second the Dn ones.
+        """
+        columns = np.asarray(columns, dtype=np.int64)
+        count = len(self.points); per_set = self.band_range[1] - self.band_range[0] + 1
+        table = np.zeros((count, len(columns)))
+        sets = (('Up', 0), ('Dn', per_set)) if self.spin == 'on' else (('', 0),)
+        for suffix, offset in sets:
+            mine = np.flatnonzero((columns >= offset) & (columns < offset + per_set))
+            if not len(mine):
+                continue
+            bands = columns[mine] - offset; low, high = int(bands.min()), int(bands.max()) + 1
+            for component in components:
+                for path in component['paths'][suffix]:
+                    dataset = self.file[path]
+                    for start in range(0, count, rows):
+                        block = np.asarray(dataset[start:start + rows, low:high], dtype=float)
+                        squares = np.sum(block * block, axis=tuple(range(2, block.ndim)))
+                        table[start:start + rows, mine] += squares[:, bands - low]
+        return table
+
+    def interpolate_table(self, table, cartesian, which):
+        """Periodic trilinear interpolation of table[:, which[i]] at cartesian[i]."""
+        target = np.asarray(cartesian, dtype=float).reshape(-1, 3)
+        which = np.asarray(which, dtype=np.int64)
+        scaled = (target @ np.linalg.inv(G)) * self.ns
+        lower = np.floor(scaled).astype(np.int64)
+        fraction = scaled - lower
+        values = np.zeros(len(target))
+        for bits in itertools.product((0, 1), repeat=3):
+            offset = np.asarray(bits, dtype=np.int64)
+            indices = np.ravel_multi_index(((lower + offset) % self.ns).T, tuple(self.ns))
+            weight = np.prod(np.where(offset, fraction, 1.0-fraction), axis=1)
+            values += weight * table[indices, which]
         return values
 
     def interpolated_bands(self, cartesian):

@@ -1512,7 +1512,8 @@ def pad_cut_bands(grid, s, v0, rows_per_chunk=None):
     single = counts[col, band] == 1 if s['direction'] != 'kz' else np.zeros(len(col), dtype=bool)
     lines = np.full((columns, band_count), np.nan)
     lines[col[single], band[single]] = -root[single]
-    lines = lines[:, np.isfinite(lines).any(axis=0)]
+    kept = np.flatnonzero(np.isfinite(lines).any(axis=0))
+    lines = lines[:, kept]
     rest = ~single
     if s['direction'] == 'kz':
         k_points = np.sqrt(np.maximum((s['hv'] + v0 - root[rest]) / H2M - kp2[col[rest]], 0.0))
@@ -1521,6 +1522,9 @@ def pad_cut_bands(grid, s, v0, rows_per_chunk=None):
     return {'k': cartesian_axis(s) if s['direction'] != 'kz' else None,
             'bands': lines if s['direction'] != 'kz' else None,
             'points': np.column_stack((k_points, -root[rest])),
+            # Band-table columns of 'bands', and slice column and band of
+            # every point (Band Component reads the states there).
+            'band_index': kept, 'point_column': col[rest], 'point_band': band[rest],
             'error': error, 'path': PAD_SLICE_PATH,
             'method': 'EB = -E_n(k(EB)) crossings; periodic trilinear interpolation of eigenvalues'}
 
@@ -1549,6 +1553,20 @@ def pad_at_bands(values, s, column, eb):
     return np.fmax(values[lower, column], values[upper, column])
 
 
+def band_line_segments(k, eb, values):
+    """Segments of every band between neighbouring k columns, (k, EB) at both
+    ends, and the mean of the values at the ends (the one end that is not NaN).
+
+    eb and values are (k columns, bands); NaN where a band is not in the slice.
+    """
+    j, b = np.nonzero(np.isfinite(eb[:-1]) & np.isfinite(eb[1:]))
+    segments = np.stack((np.column_stack((k[j], eb[j, b])),
+                         np.column_stack((k[j + 1], eb[j + 1, b]))), axis=1).reshape(-1, 2, 2)
+    first, second = values[j, b], values[j + 1, b]
+    return segments, np.where(np.isnan(first), second,
+                              np.where(np.isnan(second), first, (first + second) / 2))
+
+
 def pad_colored_bands(line, cuts, s):
     """Band-diagram geometry with the PAD intensity of every band position.
 
@@ -1565,12 +1583,7 @@ def pad_colored_bands(line, cuts, s):
         intensity = np.full(eb.shape, np.nan)
         j, b = np.nonzero(np.isfinite(eb))
         intensity[j, b] = pad_at_bands(values, s, j, eb[j, b])
-        j, b = np.nonzero(np.isfinite(eb[:-1]) & np.isfinite(eb[1:]))
-        segments = np.stack((np.column_stack((k[j], eb[j, b])),
-                             np.column_stack((k[j + 1], eb[j + 1, b]))), axis=1).reshape(-1, 2, 2)
-        first, second = intensity[j, b], intensity[j + 1, b]
-        segment_values = np.where(np.isnan(first), second,
-                                  np.where(np.isnan(second), first, (first + second) / 2))
+        segments, segment_values = band_line_segments(k, eb, intensity)
     points = np.asarray(line.get('points', np.zeros((0, 2))), dtype=float).reshape(-1, 2)
     xy = np.column_stack((points[:, 0], -points[:, 1]))
     if s['direction'] == 'kz':
@@ -1580,6 +1593,56 @@ def pad_colored_bands(line, cuts, s):
     point_values = pad_at_bands(values, s, column, xy[:, 1]) if len(points) else np.zeros(0)
     return dict(segments=segments, segment_values=segment_values, points=xy,
                 point_values=point_values, range=value_range)
+
+
+def band_component_cut(grid, s, v0, components, line=None):
+    """Band Diagram (PAD cut) with the orbital character of every band position.
+
+    The band positions are those of pad_cut_bands() (calculated again when
+    `line` has no band indices, e.g. a result saved by an earlier version).
+    At each one, k = (kx, ky, kz(EB)) on the photoemission sphere, Σ|c|² of
+    the orbital components (core.orbital_components()) is periodically
+    trilinearly interpolated on the mesh; |c|² does not depend on the phase
+    of the eigenvector.
+
+    Returns 'line', 'line_values' (shaped like line['bands']) and
+    'point_values' (one per line['points']).
+    """
+    if not line or line.get('band_index') is None:
+        line = pad_cut_bands(grid, s, v0)
+    x, y = slice_path(s); kp2 = x * x + y * y
+    bands = (np.zeros((len(x), 0)) if line.get('bands') is None
+             else np.asarray(line['bands'], dtype=float))
+    j, b = np.nonzero(np.isfinite(bands))
+    points = np.asarray(line['points'], dtype=float).reshape(-1, 2)
+    column = np.concatenate((j, np.asarray(line['point_column'], dtype=np.int64)))
+    band = np.concatenate((np.asarray(line['band_index'], dtype=np.int64)[b],
+                           np.asarray(line['point_band'], dtype=np.int64)))
+    eb = np.concatenate((-bands[j, b], -points[:, 1]))
+    values = np.zeros(0)
+    if len(band):
+        kz = np.sqrt(np.maximum((s['hv'] + v0 - eb) / H2M - kp2[column], 0.0))
+        used, which = np.unique(band, return_inverse=True)
+        table = grid.component_table(components, used)
+        values = grid.interpolate_table(table, np.column_stack((x[column], y[column], kz)), which)
+    line_values = np.full(bands.shape, np.nan); line_values[j, b] = values[:len(j)]
+    return dict(line=line, line_values=line_values, point_values=values[len(j):])
+
+
+def component_colored_bands(cut):
+    """band_component_cut() as pad_colored_bands() returns it, with Σ|c|² as
+    the values; 'range' is the minimum and maximum Σ|c|² of the bands."""
+    line = cut['line']; segments = np.zeros((0, 2, 2)); segment_values = np.zeros(0)
+    if line.get('k') is not None and line.get('bands') is not None:
+        segments, segment_values = band_line_segments(
+            np.asarray(line['k'], dtype=float), -np.asarray(line['bands'], dtype=float), cut['line_values'])
+    points = np.asarray(line['points'], dtype=float).reshape(-1, 2)
+    values = np.concatenate((np.ravel(cut['line_values']), np.ravel(cut['point_values'])))
+    finite = values[np.isfinite(values)]
+    value_range = (float(finite.min()), float(finite.max())) if finite.size else (np.nan, np.nan)
+    return dict(segments=segments, segment_values=segment_values,
+                points=np.column_stack((points[:, 0], -points[:, 1])),
+                point_values=np.asarray(cut['point_values'], dtype=float), range=value_range)
 
 
 SPHERE_CONTOUR_POINTS = 151  # kx (and ky) samples of the band contour grid, at most
@@ -1664,6 +1727,45 @@ def pad_band_limits(value_range):
     return low, (high if high > low else low + 1.0)
 
 
+def intensity_norm(gamma, vmin=None, vmax=None):
+    """Colour normalization for an Intensity display γ: linear, or value^γ
+    (PowerNorm); colour bars keep the values themselves."""
+    if gamma is None or gamma == 1.0:
+        return matplotlib.colors.Normalize(vmin, vmax)
+    return matplotlib.colors.PowerNorm(gamma, vmin, vmax)
+
+
+def draw_colored_bands(fig, ax, colored, shift, norm, label):
+    """Bands of pad_colored_bands() or component_colored_bands() coloured
+    (rainbow) by their values with norm, grey where there is no value; EB is
+    moved by the EF shift.  Returns the colour bar (None without values)."""
+    def colors(values):
+        return PAD_BAND_CMAP(norm(np.ma.masked_invalid(values)))
+    segments = colored['segments'].copy(); segments[..., 1] += shift
+    if len(segments):
+        ax.add_collection(LineCollection(
+            segments, colors=colors(colored['segment_values']),
+            linewidths=np.where(np.isnan(colored['segment_values']), .6, 1.2)))
+    points = colored['points']
+    if len(points):
+        ax.scatter(points[:, 0], points[:, 1] + shift, c=colors(colored['point_values']), s=6)
+    if np.isfinite(colored['range'][0]):
+        return panel_colorbar(fig, matplotlib.cm.ScalarMappable(norm=norm, cmap=PAD_BAND_CMAP), ax, label)
+    return None
+
+
+def fill_canvas(figure, canvas):
+    """Make the figure exactly as large as its canvas widget.
+
+    A size given in inches can come out a pixel short of the widget; without
+    a resize event (a redraw at the same size) that last row of the widget
+    then shows stale pixels.  The panels keep their places (figure fractions).
+    """
+    ratio = getattr(canvas, 'device_pixel_ratio', 1) or 1
+    figure.set_size_inches((canvas.width() * ratio + 1e-6) / figure.dpi,
+                           (canvas.height() * ratio + 1e-6) / figure.dpi, forward=False)
+
+
 def panel_colorbar(fig, mappable, ax, label):
     """Colour bar beside a panel, as tall as the panel itself.
 
@@ -1677,6 +1779,7 @@ def panel_colorbar(fig, mappable, ax, label):
         own, panel = cax.get_position(original=True), ax.get_position(original=False)
         return matplotlib.transforms.Bbox.from_bounds(own.x0, panel.y0, own.width, panel.height)
     colorbar.ax.set_axes_locator(locate)
+    ax.panel_colorbar = colorbar  # found by slice_panel_geometry()
     return colorbar
 
 
@@ -2157,6 +2260,7 @@ class Window(QtWidgets.QMainWindow):
         self._preferred_structure = self._session.get("structure")
         self.result = self.thread = self.worker = None; self._closing = False
         self.v0_dialog = None  # Calculation > Calc with changing V0…
+        self.band_component_dialog = None  # Calculation > Band Component…
         self.keep_awake = SleepInhibitor()  # no sleep while a calculation runs
         self._loaded_project = None; self._loaded_project_saved = None  # last project file read
         self._display_job = 0; self._pending_display = None
@@ -2568,6 +2672,7 @@ class Window(QtWidgets.QMainWindow):
         calc_menu = self.menuBar().addMenu("Calculation")
         self.calc_action = self.add_menu_action(calc_menu, "Calc", self.calculate)
         self.v0_scan_action = self.add_menu_action(calc_menu, "Calc with changing V0…", self.show_v0_scan)
+        self.add_menu_action(calc_menu, "Band Component…", self.show_band_component)
         self.add_menu_action(calc_menu, "Show calculation log", self.show_log)
         self.cancel_action = self.add_menu_action(calc_menu, "Cancel calculation", self.stop_calculation)
         self.cancel_action.setEnabled(False)
@@ -3597,6 +3702,14 @@ class Window(QtWidgets.QMainWindow):
         self.v0_dialog.follow_project(self.current_project())
         self.v0_dialog.show(); self.v0_dialog.raise_(); self.v0_dialog.activateWindow()
 
+    def show_band_component(self):
+        """Calculation > Band Component…"""
+        if self.band_component_dialog is None:
+            self.band_component_dialog = BandComponentDialog(self)
+        self.band_component_dialog.refresh_components()
+        self.band_component_dialog.show(); self.band_component_dialog.raise_()
+        self.band_component_dialog.activateWindow()
+
     def start_v0_scan(self, dialog, v0_values):
         """Calculate the PAD slice for each V0 with the other parameters of the
         sidebar; returns False if it did not start."""
@@ -3646,9 +3759,9 @@ class Window(QtWidgets.QMainWindow):
         self.thread.start(); self.start_keep_awake()
         return True
 
-    def slice_panel_geometry(self):
-        """The PAD Slice panel of this window in inches, for drawing it
-        elsewhere at exactly the same size.
+    def slice_panel_geometry(self, title='PAD Slice'):
+        """The PAD Slice panel of this window (or the panel whose title starts
+        with `title`) in inches, for drawing it elsewhere at exactly the same size.
 
         Returns the size of a figure that just holds the panel with its
         labels, Ek axis and colour bar, the boxes (x0, y0, width, height) of
@@ -3657,9 +3770,8 @@ class Window(QtWidgets.QMainWindow):
         """
         fig = self.canvas.figure
         ppi = fig.dpi / max(getattr(self.canvas, 'device_pixel_ratio', 1) or 1, 1e-9)
-        ax = next((a for a in fig.axes if a.get_title().startswith('PAD Slice')), None)
-        colorbar = None if ax is None else next(
-            (c.colorbar.ax for c in ax.collections if getattr(c, 'colorbar', None) is not None), None)
+        ax = next((a for a in fig.axes if a.get_title().startswith(title)), None)
+        colorbar = getattr(getattr(ax, 'panel_colorbar', None), 'ax', None)
         if ax is None or colorbar is None:
             return dict(size=(5.95, 4.4), ax=(0.85, 0.6, 3.4, 3.4), colorbar=(5.0, 0.6, 0.17, 3.4),
                         ppi=ppi, measured=False)
@@ -3687,6 +3799,7 @@ class Window(QtWidgets.QMainWindow):
         except (OSError, ValueError) as exc:
             self.append_log(f"Could not save PAD parameters on exit: {exc}")
         self.store_session()
+        if self.band_component_dialog is not None: self.band_component_dialog.wait()
         if self.thread:
             self._closing=True; self.stop_calculation(); event.ignore()
         else: event.accept()
@@ -3819,10 +3932,7 @@ class Window(QtWidgets.QMainWindow):
     def intensity_norm(self, vmin=None, vmax=None):
         """Colour normalization of the PAD intensity chosen in Intensity
         display: linear, or PAD^γ (PowerNorm); the colour bars keep PAD values."""
-        gamma = self.intensity.currentData() if hasattr(self, 'intensity') else 1.0
-        if gamma is None or gamma == 1.0:
-            return matplotlib.colors.Normalize(vmin, vmax)
-        return matplotlib.colors.PowerNorm(gamma, vmin, vmax)
+        return intensity_norm(self.intensity.currentData() if hasattr(self, 'intensity') else 1.0, vmin, vmax)
 
     def intensity_changed(self, *args):
         """A new intensity scale is only drawn again: no Calc."""
@@ -3932,30 +4042,22 @@ class Window(QtWidgets.QMainWindow):
         line=r.get('line') or {}
         if line.get('path')==PAD_SLICE_PATH:
             colored=pad_colored_bands(line,cuts,s)
-            band_norm=self.intensity_norm(*pad_band_limits(colored['range']))
-            def band_colors(values):
-                return PAD_BAND_CMAP(band_norm(np.ma.masked_invalid(values)))
-            segments=colored['segments'].copy(); segments[...,1]+=shift
-            if len(segments):
-                ax.add_collection(LineCollection(
-                    segments,colors=band_colors(colored['segment_values']),
-                    linewidths=np.where(np.isnan(colored['segment_values']),.6,1.2)))
-            points=colored['points']
-            if len(points):
-                ax.scatter(points[:,0],points[:,1]+shift,c=band_colors(colored['point_values']),s=6)
-            if np.isfinite(colored['range'][0]):
-                panel_colorbar(fig,matplotlib.cm.ScalarMappable(norm=band_norm,cmap=PAD_BAND_CMAP),ax,'PAD')
+            draw_colored_bands(fig,ax,colored,shift,self.intensity_norm(*pad_band_limits(colored['range'])),'PAD')
         else:
             # A band cut from an earlier version (fixed kz): plain lines.
             if line.get('k') is not None and line.get('bands') is not None:
                 for band in np.asarray(line['bands']).T: ax.plot(line['k'],-band+shift,'k',lw=.8)
             points=np.asarray(line.get('points',np.zeros((0,2))),dtype=float).reshape(-1,2)
             if len(points): ax.plot(points[:,0],-points[:,1]+shift,'k.',ms=2)
+        self.pad_cut_axes(ax,s,r['v0'],axis)
+        return ax.axhline(eb_display,**RED_DOTTED)
+
+    def pad_cut_axes(self, ax, s, v0, axis):
+        """Limits, labels, Ek axis and BZ lines of a Band Diagram (PAD cut)."""
         if s['direction']!='kz': ax.set_xlim(axis[0],axis[-1])
         ax.set(ylim=(s['eb_max'],s['eb_min']),xlabel=f"{s['direction']} (Å⁻¹)",
                ylabel='EB′ = EB + EF shift (eV)',title='Band Diagram (PAD cut)')
-        marker=ax.axhline(eb_display,**RED_DOTTED); self.add_ek_axis(ax,s,r['v0']); self.line_bz(ax,s)
-        return marker
+        self.add_ek_axis(ax,s,v0); self.line_bz(ax,s)
 
     def draw_trajectories(self, fig, ax, r, axis):
         """kx-kz photoelectron trajectories on the photoemission spheres."""
@@ -4564,7 +4666,7 @@ class V0ScanDialog(QtWidgets.QDialog):
             self.geometry = self.window.slice_panel_geometry()
         g = self.geometry; width, height = g['size']
         self.canvas.setFixedSize(max(1, round(width * g['ppi'])), max(1, round(height * g['ppi'])))
-        self.render(self.figure, view, g)
+        self.render(self.figure, view, g); fill_canvas(self.figure, self.canvas)
         self.toolbar.update()  # Home goes back to this graph
         self.canvas.draw_idle()
 
@@ -4591,6 +4693,213 @@ class V0ScanDialog(QtWidgets.QDialog):
                 if other is not ax: other.set_position(rect(g['colorbar']))
             ax.set_title(f"PAD Slice {s['direction']}-EB, V0={view['v0']:g} eV"
                          + ("" if view.get('complete') else " (calculating)"))
+        return ax
+
+
+class BandComponentWorker(QtCore.QObject):
+    """Σ|c|² of the chosen orbital components along the band diagram, off the GUI thread."""
+    done = QtCore.pyqtSignal(object); error = QtCore.pyqtSignal(str)
+
+    def __init__(self, mesh_path, s, v0, keys, line=None):
+        super().__init__()
+        self.mesh_path = mesh_path; self.s = s; self.v0 = v0; self.keys = list(keys); self.line = line
+
+    def run(self):
+        try:
+            grid = core.EigenstateGrid(self.mesh_path)
+            try:
+                components = {c['key']: c for c in core.orbital_components(grid.file)}
+                chosen = [components[key] for key in self.keys if key in components]
+                if not chosen:
+                    raise ValueError('The ticked orbital components are not in this k-space HDF5.')
+                cut = band_component_cut(grid, self.s, self.v0, chosen, self.line)
+            finally:
+                grid.close()
+            self.done.emit(cut)
+        except Exception as exc:
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+
+
+class BandComponentDialog(QtWidgets.QDialog):
+    """Calculation > Band Component…
+
+    Display lists the orbital components of the LCAO coefficients of the
+    shown result (species and OpenMX radial orbital, e.g. "Si 2p (p0)"; see
+    core.orbital_components()).  Calc draws the Band Diagram (PAD cut) of the
+    main window with every band coloured (rainbow, minimum to maximum) by Σ|c|²
+    of the ticked components there, at exactly the size of the main window's
+    panel and with the matplotlib toolbar.  Intensity display scales the
+    colours like the main window's, but is kept apart from it.
+    """
+
+    TITLE = 'Band Diagram (PAD cut)'
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.mesh_path = None  # k-space HDF5 whose components are listed
+        self.checked = set()  # ticked component keys, kept when the list is built again
+        self.view = None  # the calculated band diagram on the graph
+        self.geometry = None; self.calc_thread = None; self.worker = None; self.pending = None
+        self._line = None  # (result, band geometry with band indices) reused by the next Calc
+        self.setWindowTitle("Band Component")
+        self.components = QtWidgets.QListWidget()
+        self.components.setToolTip("Orbital components of the LCAO coefficients: Σ|c|² of the ticked "
+                                   "ones colours the bands")
+        self.components.itemChanged.connect(self.component_toggled)
+        self.figure = Figure(); self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        self.calc_button = QtWidgets.QPushButton("Calc")
+        self.calc_button.setToolTip("Colour the Band Diagram (PAD cut) of the shown result by Σ|c|² "
+                                    "of the ticked orbital components")
+        self.calc_button.clicked.connect(self.calc_clicked)
+        # Its own Intensity display: the main window's is not changed.
+        self.intensity = QtWidgets.QComboBox()
+        for label, gamma in INTENSITY_SCALES: self.intensity.addItem(label, gamma)
+        self.intensity.setToolTip("Colour scale of Σ|c|²: linear, or Σ|c|²^γ (this window only)")
+        self.intensity.currentIndexChanged.connect(self.redraw)
+        self.status = QtWidgets.QLabel(); self.status.setWordWrap(True)
+        # Display, Calc, Intensity display, then the graph.
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel("Display:")); layout.addWidget(self.components)
+        layout.addWidget(self.calc_button)
+        form = QtWidgets.QFormLayout(); form.addRow("Intensity display", self.intensity)
+        layout.addLayout(form); layout.addWidget(self.status)
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        # The dialog follows the canvas, which has the size of the main panel.
+        layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetFixedSize)
+        self.draw()
+
+    def result_mesh(self):
+        """The main window's result and its k-space HDF5 (None if not available)."""
+        r = self.window.result; path = r.get('mesh_path') if r else None
+        return r, (path if path and Path(path).is_file() else None)
+
+    def refresh_components(self):
+        """List the orbital components of the shown result's k-space HDF5."""
+        r, path = self.result_mesh()
+        if path == self.mesh_path and self.components.count():
+            return
+        self.mesh_path = path
+        self.components.blockSignals(True); self.components.clear()
+        found = []
+        if r is None:
+            self.status.setText("No PAD result is shown in the main window: press Calc there first.")
+        elif path is None:
+            self.status.setText("The k-space HDF5 of the shown result is not available: "
+                                f"{r.get('mesh_path') or 'not recorded'}")
+        else:
+            try:
+                with h5py.File(path, 'r') as f:
+                    found = core.orbital_components(f)
+            except (OSError, KeyError, ValueError) as exc:
+                self.status.setText(f"Cannot read the orbital components: {exc}")
+        for component in found:
+            item = QtWidgets.QListWidgetItem(component['label'])
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, component['key'])
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if component['key'] in self.checked
+                               else QtCore.Qt.CheckState.Unchecked)
+            atoms = ', '.join(map(str, component['atoms']))
+            item.setToolTip(f"OpenMX orbital {component['orbital']} of {component['species']}, "
+                            f"atom{'s' if len(component['atoms']) > 1 else ''} {atoms}: all m and spin parts")
+            self.components.addItem(item)
+        self.components.blockSignals(False)
+        rows = min(max(self.components.count(), 3), 8)
+        row = self.components.sizeHintForRow(0) if self.components.count() else self.fontMetrics().height() + 4
+        self.components.setFixedHeight(rows * row + 2 * self.components.frameWidth() + 4)
+
+    def component_toggled(self, item):
+        key = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if item.checkState() == QtCore.Qt.CheckState.Checked: self.checked.add(key)
+        else: self.checked.discard(key)
+
+    def checked_components(self):
+        """(key, label) of the ticked components in list order."""
+        items = (self.components.item(i) for i in range(self.components.count()))
+        return [(item.data(QtCore.Qt.ItemDataRole.UserRole), item.text()) for item in items
+                if item.checkState() == QtCore.Qt.CheckState.Checked]
+
+    def calc_clicked(self):
+        if self.calc_thread is not None:
+            return
+        self.refresh_components()
+        r, path = self.result_mesh()
+        if path is None:
+            return  # refresh_components() said why
+        chosen = self.checked_components()
+        if not chosen:
+            self.status.setText("Tick at least one orbital component under Display."); return
+        line = self._line[1] if self._line and self._line[0] is r else r.get('line')
+        self.pending = dict(result=r, s=r['s'], v0=r['v0'], labels=[label for _, label in chosen])
+        self.calc_thread = QtCore.QThread(self)
+        self.worker = worker = BandComponentWorker(path, r['s'], r['v0'], [key for key, _ in chosen], line)
+        worker.moveToThread(self.calc_thread)
+        self.calc_thread.started.connect(worker.run)
+        worker.done.connect(self.calc_done); worker.error.connect(self.calc_failed)
+        worker.done.connect(self.calc_thread.quit); worker.error.connect(self.calc_thread.quit)
+        self.calc_thread.finished.connect(worker.deleteLater); self.calc_thread.finished.connect(self.calc_thread_finished)
+        self.calc_button.setEnabled(False)
+        self.status.setText(f"Calculating Σ|c|² of {', '.join(self.pending['labels'])}…")
+        self.calc_thread.start()
+
+    def calc_done(self, cut):
+        pending = self.pending
+        self._line = (pending['result'], cut['line'])
+        colored = component_colored_bands(cut)
+        self.view = dict(s=pending['s'], v0=pending['v0'], labels=pending['labels'], colored=colored)
+        low, high = colored['range']
+        self.status.setText(f"Σ|c|² of {', '.join(pending['labels'])}"
+                            + (f": {low:.4g} to {high:.4g}" if np.isfinite(low) else ": no bands in this slice"))
+        self.geometry = None  # measure the main window's panel again
+        self.draw()
+
+    def calc_failed(self, message):
+        self.status.setText(f"Band Component failed: {message}")
+
+    def calc_thread_finished(self):
+        self.calc_thread.deleteLater(); self.calc_thread = None; self.worker = None
+        self.calc_button.setEnabled(True)
+
+    def wait(self):
+        """Let a running calculation end (the window is closing)."""
+        if self.calc_thread is not None:
+            self.calc_thread.wait()
+
+    def redraw(self, *args):
+        """Draw again (e.g. another Intensity display): no Calc."""
+        self.draw()
+
+    def draw(self):
+        if self.geometry is None:
+            self.geometry = self.window.slice_panel_geometry(self.TITLE)
+        g = self.geometry; width, height = g['size']
+        self.canvas.setFixedSize(max(1, round(width * g['ppi'])), max(1, round(height * g['ppi'])))
+        self.render(self.figure, self.view, g); fill_canvas(self.figure, self.canvas)
+        self.toolbar.update()  # Home goes back to this graph
+        self.canvas.draw_idle()
+
+    def render(self, fig, view, g):
+        """Draw the coloured band diagram (or a hint) into fig with geometry g."""
+        width, height = g['size']
+        fig.clear(); fig.set_size_inches(width, height, forward=False)
+        def rect(box):
+            return (box[0] / width, box[1] / height, box[2] / width, box[3] / height)
+        ax = fig.add_axes(rect(g['ax']))
+        if view is None:
+            ax.text(.5, .5, 'Tick orbital components under Display\nand press Calc', ha='center',
+                    va='center', transform=ax.transAxes)
+            ax.set(xticks=[], yticks=[], title=self.TITLE)
+            return ax
+        s = view['s']; colored = view['colored']
+        norm = intensity_norm(self.intensity.currentData(), *pad_band_limits(colored['range']))
+        draw_colored_bands(fig, ax, colored, s.get('ef_shift', 0.0), norm, 'Σ|c|²')
+        self.window.pad_cut_axes(ax, s, view['v0'], cartesian_axis(s))
+        # fig.colorbar takes its room from the panel: put both back.
+        ax.set_position(rect(g['ax']))
+        for other in fig.axes:
+            if other is not ax: other.set_position(rect(g['colorbar']))
         return ax
 
 
