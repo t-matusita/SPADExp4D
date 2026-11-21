@@ -37,6 +37,7 @@ import matplotlib
 
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 import contourpy
@@ -1123,6 +1124,147 @@ def load_pad_result(path):
     return result
 
 
+# One project HDF5 per calculation target and calculation result:
+# <target>/results/<result>/project.h5.  It holds the PAD result (the format
+# of save_pad_result()), the sidebar values of its Calc and the EB shown
+# (group GUI), and the Calc with changing V0 values and results (group V0Scan).
+# The file is read when the program starts, when the target or the result is
+# switched, and when the V0 dialog opens.
+PROJECT_FILE = "project.h5"
+PROJECT_FORMAT = "SPADExp4D project"  # a project file without a PAD result (yet)
+PROJECT_VERSION = 1
+
+
+def project_path(record):
+    """The project file of a calculation result folder (None without one)."""
+    return Path(record) / PROJECT_FILE if record else None
+
+
+def _now_text():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _write_gui(f, gui):
+    group = f.require_group("GUI")
+    if gui.get("values") is not None:
+        group.attrs["values"] = json.dumps(gui["values"], sort_keys=True, ensure_ascii=False)
+        group.attrs["saved"] = gui.get("saved") or _now_text()
+    if gui.get("display") is not None:
+        group.attrs["display"] = json.dumps(gui["display"], sort_keys=True)
+
+
+def _write_v0scan(f, scan):
+    """Group V0Scan: the dialog values and the PAD slice of every calculated V0."""
+    if "V0Scan" in f:
+        del f["V0Scan"]
+    group = f.create_group("V0Scan")
+    group.attrs["parameters"] = json.dumps(scan.get("parameters") or {}, sort_keys=True, ensure_ascii=False)
+    results = scan.get("results") or {}
+    if not results:
+        return
+    v0s = sorted(results); first = results[v0s[0]]
+    ebs = sorted(first["cuts"]); k = np.asarray(first["cuts"][ebs[0]]["k"], dtype=float)
+    shape = (len(v0s), len(ebs), len(k))
+    pad = np.full(shape, np.nan); weight = np.full(shape, np.nan)
+    for i, v0 in enumerate(v0s):
+        cuts = results[v0]["cuts"]
+        for j, eb in enumerate(ebs):
+            cut = cuts.get(eb)
+            if cut is not None:
+                pad[i, j] = cut["pad"]; weight[i, j] = cut["band_weight"]
+    settings = dict(first["s"]); settings.pop("v0", None)
+    group.attrs.update(settings=json.dumps(settings, sort_keys=True, ensure_ascii=False),
+                       structure_name=first.get("structure_name") or "",
+                       description="PAD slice (Gaussian dK/dE applied) of each V0: V0, EB, k")
+    group.create_dataset("v0", data=np.asarray(v0s, dtype=float)).attrs["units"] = "eV"
+    group.create_dataset("binding_energy", data=np.asarray(ebs, dtype=float)).attrs["units"] = "eV"
+    group.create_dataset("k", data=k).attrs["units"] = "1/Angstrom"
+    options = dict(compression="gzip", shuffle=True)
+    group.create_dataset("pad", data=pad, **options)
+    group.create_dataset("band_weight", data=weight, **options)
+
+
+def _read_v0scan(group):
+    scan = {"parameters": json.loads(group.attrs.get("parameters", "{}")), "results": {}}
+    if "v0" not in group:
+        return scan
+    settings = json.loads(group.attrs["settings"]); name = str(group.attrs.get("structure_name", "")) or None
+    ebs = [round(float(eb), 8) for eb in group["binding_energy"][()]]; k = group["k"][()]
+    pad = group["pad"][()]; weight = group["band_weight"][()]
+    for i, v0 in enumerate(group["v0"][()]):
+        v0 = float(v0)
+        cuts = {eb: {"eb": eb, "k": k, "pad": pad[i, j], "band_weight": weight[i, j]}
+                for j, eb in enumerate(ebs)}
+        scan["results"][v0] = dict(s=dict(settings, v0=v0), v0=v0, cuts=cuts, structure_name=name,
+                                   complete=True)
+    return scan
+
+
+def save_project_result(path, result, structure_path=None, gui=None):
+    """Write the PAD result of a Calc (and its sidebar values) to a project
+    file; the V0 scan and GUI entries already in the file are kept."""
+    path = Path(path); new = path.with_name(path.name + ".new")
+    save_pad_result(new, result, structure_path)
+    with h5py.File(new, "a") as f:
+        f.attrs["project_version"] = PROJECT_VERSION
+        if path.is_file():
+            try:
+                with h5py.File(path, "r") as old:
+                    for name in ("GUI", "V0Scan"):
+                        if name in old:
+                            old.copy(old[name], f, name)
+            except OSError:
+                pass  # an unreadable old file is replaced
+        if gui:
+            _write_gui(f, gui)
+    new.replace(path)
+    return path
+
+
+def update_project(path, gui=None, v0scan=None):
+    """Update the GUI or V0 scan entries of a project file in place (a file
+    without a PAD result is created when missing)."""
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "a") as f:
+        if "format" not in f.attrs:
+            f.attrs.update(format=PROJECT_FORMAT, format_version=PAD_RESULT_VERSION,
+                           project_version=PROJECT_VERSION, software=f"SPADExp4D {__version__}",
+                           created=datetime.now().astimezone().isoformat(timespec="seconds"))
+        if gui:
+            _write_gui(f, gui)
+        if v0scan is not None:
+            _write_v0scan(f, v0scan)
+    return path
+
+
+def read_project(path, pad=True):
+    """Everything stored in a project file: {"result": PAD result or None,
+    "gui": {"values", "saved", "display"}, "v0scan": {"parameters", "results"}}.
+    pad=False skips the (large) PAD result."""
+    path = Path(path); project = {"result": None, "gui": {}, "v0scan": None, "path": str(path)}
+    try:
+        with h5py.File(path, "r") as f:
+            if f.attrs.get("format") not in (PAD_RESULT_FORMAT, PROJECT_FORMAT):
+                raise ValueError(f"Not a SPADExp4D project file: {path}")
+            has_pad = "PAD" in f
+            if "GUI" in f:
+                attrs = f["GUI"].attrs
+                for key in ("values", "display"):
+                    if key in attrs:
+                        project["gui"][key] = json.loads(attrs[key])
+                if "saved" in attrs:
+                    project["gui"]["saved"] = str(attrs["saved"])
+            if "V0Scan" in f:
+                project["v0scan"] = _read_v0scan(f["V0Scan"])
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read the project file {path}: {exc}") from exc
+    if has_pad and pad:
+        project["result"] = load_pad_result(path)
+        project["result"].pop("source_file", None)  # not an opened file, but this result's own
+        project["result"]["result_record"] = str(path.parent)
+    return project
+
+
 def prune_old_pad_artifacts():
     """Remove legacy slice caches and diagnostics from older PAD requests."""
     removed = 0; removed_bytes = 0
@@ -1598,13 +1740,15 @@ class Worker(QtCore.QObject):
     partial = QtCore.pyqtSignal(object); log = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int); status = QtCore.pyqtSignal(str)
 
-    def __init__(self, settings, structure_path=None, save_last=False):
+    def __init__(self, settings, structure_path=None, save_last=False, gui_values=None):
         super().__init__(); self.s = settings; self.structure_path = Path(structure_path) if structure_path else None
         self.structure_name = self.structure_path.name if self.structure_path else "graphite"
         self.stop_event = threading.Event()
-        # Write the finished result to <target>/cache/LAST_PAD_RESULT so the
-        # next start can show it (the application window enables this).
-        self.save_last = save_last
+        # Register the finished result and write it, with the sidebar values
+        # of this Calc (gui_values), to the project file of that calculation
+        # result, shown again at the next start (the application window
+        # enables this).
+        self.save_last = save_last; self.gui_values = gui_values
 
     def request_stop(self):
         self.stop_event.set()
@@ -1742,13 +1886,17 @@ class Worker(QtCore.QObject):
             self.stage(99, 'Applying Gaussian dK/dE to the saved PAD')
             result = prepare_display(result, self.s, self.stop_event.is_set)
             if self.save_last and self.structure_path is not None:
-                self.stage(99, 'Saving the PAD result for the next start')
+                self.stage(99, 'Saving the project file of this calculation result')
                 try:
-                    saved = save_pad_result(self.structure_path / 'cache' / LAST_PAD_RESULT,
-                                            result, self.structure_path)
-                    self.log.emit(f'[PAD result saved] {saved}; {format_file_size(saved.stat().st_size)}')
+                    record = register_local_result(self.structure_path, result['s'], result['mesh_path'], result)
+                    if record is None:
+                        raise ValueError('the calculation result could not be registered')
+                    result['result_record'] = str(record)
+                    gui = dict(values=self.gui_values or result['s'], saved=_now_text())
+                    saved = save_project_result(project_path(record), result, self.structure_path, gui)
+                    self.log.emit(f'[Project saved] {saved}; {format_file_size(saved.stat().st_size)}')
                 except Exception as exc:  # a failed save must not fail the calculation
-                    self.log.emit(f'[PAD result not saved] {exc}')
+                    self.log.emit(f'[Project not saved] {exc}')
             self.stage(100, 'Complete'); self.done.emit(result)
         except core.Cancelled:
             self.stopped.emit(prepare_display(result, self.s))
@@ -1803,6 +1951,7 @@ class V0ScanWorker(QtCore.QObject):
     """
     partial = QtCore.pyqtSignal(object)   # slice of the V0 being calculated
     v0_done = QtCore.pyqtSignal(object)   # slice of a finished V0
+    record = QtCore.pyqtSignal(str)       # calculation result folder of the k-space HDF5 used
     done = QtCore.pyqtSignal(); error = QtCore.pyqtSignal(str); stopped = QtCore.pyqtSignal()
     log = QtCore.pyqtSignal(str); progress = QtCore.pyqtSignal(int); status = QtCore.pyqtSignal(str)
 
@@ -1830,6 +1979,13 @@ class V0ScanWorker(QtCore.QObject):
                 progress=lambda done, total: self.stage(0, f'First BZ: {done:,} / {total:,} k points'))
             grid = core.EigenstateGrid(path)
             self.log.emit(f'[K-space HDF5] {path}')
+            if self.structure_path is not None:
+                # The V0 results go to the project file of this calculation result.
+                try:
+                    record = register_local_result(self.structure_path, self.s, path)
+                    if record is not None: self.record.emit(str(record))
+                except (OSError, ValueError) as exc:
+                    self.log.emit(f'[V0 scan] Calculation result not registered: {exc}')
             requested = energies(self.s); components = polarization_components(self.s)
             cpp = self.s.get('pad_engine', 'cpp') == 'cpp'
             binary = ensure_cpp_binary(self.log.emit, stop) if cpp else SPADEXP
@@ -1939,6 +2095,7 @@ class Window(QtWidgets.QMainWindow):
         self._preferred_structure = self._session.get("structure")
         self.result = self.thread = self.worker = None; self._closing = False
         self.v0_dialog = None  # Calculation > Calc with changing V0…
+        self._loaded_project = None; self._loaded_project_saved = None  # last project file read
         self._display_job = 0; self._pending_display = None
         self._display_relay = DisplayRelay(self); self._display_relay.ready.connect(self.background_display_ready)
         self.eb_sweep_timer = QtCore.QTimer(self)
@@ -2409,6 +2566,7 @@ class Window(QtWidgets.QMainWindow):
     def structure_changed(self, index):
         global LATTICE, B
         self._stop_eb_sweep()
+        self.save_project_display()  # the EB shown for the target being left
         value = self.structure_combo.itemData(index)
         next_structure = Path(value) if value else None
         previous_structure = self.current_structure
@@ -2464,10 +2622,18 @@ class Window(QtWidgets.QMainWindow):
                 # Keep the previous lattice until a CIF is imported.
                 pass
             self.load_openmx_parameters({})  # disabled until a target exists
-        # The parameters last saved for this target win over the settings of
-        # its saved calculation result; only a target without saved
-        # parameters starts from that result.
-        self.refresh_results(preferred_result, apply_record=new_settings or self.current_structure is None)
+        # The project file of the selected calculation result is shown with
+        # the values of its Calc.  Without one, the parameters last saved for
+        # this target win over the settings of its calculation result; only a
+        # target without saved parameters starts from that result.
+        self.refresh_results(preferred_result, apply_record=False)
+        record = self.result_combo.currentData(); project = project_path(record)
+        if project is not None and project.is_file():
+            self.load_project(project)
+        else:
+            if record and (new_settings or self.current_structure is None):
+                self.load_result_settings(record)
+            if self.v0_dialog is not None: self.v0_dialog.follow_project(project)
 
     def restore_entered_values(self, values):
         """Show the values of the last exit again, even a combination that
@@ -2548,7 +2714,7 @@ class Window(QtWidgets.QMainWindow):
             value = self.result_combo.currentData()
             # setCurrentIndex() happened while signals were blocked above,
             # so load the selected result explicitly.
-            self.load_result_settings(value)
+            self.open_result_record(value)
 
     def load_result_settings(self, value):
         """Use a saved result as the editable starting point for the next Calc."""
@@ -2586,14 +2752,87 @@ class Window(QtWidgets.QMainWindow):
 
     def result_selection_changed(self, index):
         self._stop_eb_sweep()
+        self.save_project_display()  # the EB shown for the result being left
         value = self.result_combo.itemData(index)
-        self.result = None
+        self.result = None; self.cancel_background_display()
         name = self.current_structure.name if self.current_structure else "No target"
         self.clear_result_view(f"{name}: no PAD result shown.\nPress Calc to calculate or load it.")
         if value:
+            self.open_result_record(value)
+        else:
+            if self.current_structure:
+                self.message.setText(f"No calculation result: calculating {self.current_structure.name} locally")
+            if self.v0_dialog is not None: self.v0_dialog.follow_project(None)
+
+    def values_use_record(self, values, record):
+        """Whether sidebar values calculate with the k-space HDF5 of a result."""
+        try:
+            plan = core.mesh_plan(validate_settings(values))
+            return Path(plan["path"]).resolve() == (Path(record) / "eigenstates.hdf5").resolve()
+        except (KeyError, TypeError, OSError, ValueError):
+            return False
+
+    def current_project(self):
+        """The project file of the selected calculation result (None without one)."""
+        return project_path(self.result_combo.currentData()) if self.result_combo.count() else None
+
+    def open_result_record(self, value):
+        """Show a calculation result: its project file when there is one,
+        otherwise its calculation conditions as the start of the next Calc."""
+        project = project_path(value)
+        if project is not None and project.is_file():
+            self.load_project(project)
+        else:
             self.load_result_settings(value)
-        elif self.current_structure:
-            self.message.setText(f"No calculation result: calculating {self.current_structure.name} locally")
+            if self.v0_dialog is not None: self.v0_dialog.follow_project(project)
+
+    def load_project(self, path, eb=None, message=None):
+        """Show what a project file holds: the sidebar values of the last Calc
+        of that result, its PAD result (smoothed in the background) at the EB
+        shown last, and, in the V0 dialog, its V0 values and results."""
+        try:
+            project = read_project(path)
+        except ValueError as exc:
+            self.append_log(f"Could not read the project file: {exc}"); return None
+        self._loaded_project = Path(path); self._loaded_project_saved = project["gui"].get("saved")
+        values = project["gui"].get("values")
+        if isinstance(values, dict):
+            self.restore_entered_values(values)
+        result = project["result"]
+        name = self.current_structure.name if self.current_structure else None
+        if result is not None and result.get("structure_name") in (None, name):
+            result["structure_name"] = name
+            try:
+                gui = validate_settings(self.settings())
+            except ValueError:
+                gui = None
+            # Display-only changes (Gaussian widths, EF shift, θmax, boundary)
+            # are kept; otherwise the result is shown as it was calculated.
+            display = gui if gui is not None and can_reuse_display(result, gui) else result["s"]
+            stored_eb = (project["gui"].get("display") or {}).get("eb")
+            self.append_log(f"[Project loaded] {path}")
+            self.display_in_background(
+                result, display, eb if eb is not None else stored_eb,
+                message or f"{name}: {Path(path).parent.name} "
+                           f"(calculated {result.get('created') or 'earlier'}, project file)")
+        else:
+            self.message.setText(f"Project file loaded: {Path(path).parent.name} (no PAD result yet)")
+        if self.v0_dialog is not None:
+            self.v0_dialog.follow_project(Path(path), project)
+        return project
+
+    def save_project_display(self):
+        """Store the EB shown with the result of the selected project file."""
+        if not self.persist_session or self.result is None:
+            return
+        record = self.result.get("result_record")
+        project = project_path(record)
+        if project is None or not project.is_file():
+            return
+        try:
+            update_project(project, gui={"display": {"eb": self.eb()}})
+        except (OSError, ValueError) as exc:
+            self.append_log(f"Could not update the project file: {exc}")
 
     def import_cif(self):
         cif, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select crystal structure CIF", str(PROJECT), "CIF files (*.cif);;All files (*)")
@@ -2668,11 +2907,17 @@ class Window(QtWidgets.QMainWindow):
             # session keeps the entered values.
             settings = validate_settings(self.initial_settings)
         pending = self._pending_display or {}
+        # The EB shown and the V0 dialog go to the project file of the result.
+        self.save_project_display()
+        if self.v0_dialog is not None:
+            self.v0_dialog.save_project_state()
+        record = self.result_combo.currentData() if self.result_combo.count() else None
         state = {
             # Exactly what the sidebar showed, restored at the next start
             # (also when the combination cannot be used for Calc yet).
             "values": values,
             "structure": self.current_structure.name if self.current_structure else None,
+            "result": Path(record).name if record else None,  # its project file is shown again
             "eb": self.eb() if self.result else pending.get("eb"),
             # A result opened from a file is shown again instead of the last
             # calculated one.
@@ -2695,12 +2940,30 @@ class Window(QtWidgets.QMainWindow):
         state = self._session; self._preferred_structure = None
         name = self.current_structure.name if self.current_structure else None
         same_target = state.get("structure") == name
+        # The calculation result chosen at exit; choosing it shows its project file.
+        wanted = state.get("result") if same_target else None
+        if isinstance(wanted, str):
+            index = self.result_combo.findText(wanted)
+            if index >= 0 and index != self.result_combo.currentIndex():
+                self.result_combo.setCurrentIndex(index)
+        project = self.current_project()
+        from_project = project is not None and project.is_file() and self._loaded_project == project
         snapshot = calc_snapshots(state).get(name or "")
-        if isinstance(snapshot, dict) and isinstance(snapshot.get("values"), dict):
+        snapshot_values = (snapshot["values"] if isinstance(snapshot, dict)
+                           and isinstance(snapshot.get("values"), dict) else None)
+        if from_project:
+            # The project file gave the values of the last Calc of this
+            # result.  A Calc of the same result pressed later but not
+            # finished (stopped, or the program ended) wins.
+            if (snapshot_values is not None
+                    and str(snapshot.get("saved") or "") > str(self._loaded_project_saved or "")
+                    and self.values_use_record(snapshot_values, project.parent)):
+                self.restore_entered_values(snapshot_values)
+        elif snapshot_values is not None:
             # Every value of the last Calc of this target, saved when Calc
             # was pressed, comes first: it wins over parameter.json and over
             # values changed afterwards (or left over from an earlier exit).
-            self.restore_entered_values(snapshot["values"])
+            self.restore_entered_values(snapshot_values)
         elif same_target and state:
             # Selecting the target applied its parameter.json; the values
             # shown at exit take precedence, exactly as they were entered,
@@ -2732,7 +2995,9 @@ class Window(QtWidgets.QMainWindow):
             self.restoreGeometry(QtCore.QByteArray.fromBase64(state["geometry"].encode("ascii")))
         if self.current_structure is None:
             return
-        candidates = [self.current_structure / "cache" / LAST_PAD_RESULT]
+        # A PAD result file open at exit is shown again; without a project
+        # file, the last result saved by an earlier version is shown.
+        candidates = [] if from_project else [self.current_structure / "cache" / LAST_PAD_RESULT]
         if same_target and state.get("result_file"):
             candidates.insert(0, Path(state["result_file"]))
         for path in candidates:
@@ -2984,6 +3249,9 @@ class Window(QtWidgets.QMainWindow):
             if self.persist_session and self.current_structure:
                 # Saved values are restored at the next start, as those of Calc.
                 save_calc_snapshot(self.current_structure.name, self.settings())
+                project = self.current_project()
+                if project is not None and project.is_file():
+                    update_project(project, gui={"values": self.settings(), "saved": _now_text()})
         except (OSError, ValueError) as exc:
             QtWidgets.QMessageBox.critical(self, "Settings save error", str(exc))
 
@@ -3248,7 +3516,8 @@ class Window(QtWidgets.QMainWindow):
         self.calc.setEnabled(False); self.calc_action.setEnabled(False); self.cancel_action.setEnabled(True)
         self.play_eb_button.setEnabled(False)
         self.thread=QtCore.QThread(self)
-        self.worker=Worker(settings, self.current_structure, save_last=self.persist_session)
+        self.worker=Worker(settings, self.current_structure, save_last=self.persist_session,
+                           gui_values=self.settings())
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.status.connect(self.message.setText); self.worker.progress.connect(self.progress.setValue)
@@ -3261,6 +3530,8 @@ class Window(QtWidgets.QMainWindow):
         """Calculation > Calc with changing V0…"""
         if self.v0_dialog is None:
             self.v0_dialog = V0ScanDialog(self)
+        # The V0 values and results stored for the selected calculation result.
+        self.v0_dialog.follow_project(self.current_project())
         self.v0_dialog.show(); self.v0_dialog.raise_(); self.v0_dialog.activateWindow()
 
     def start_v0_scan(self, dialog, v0_values):
@@ -3303,6 +3574,7 @@ class Window(QtWidgets.QMainWindow):
         worker.status.connect(self.message.setText); worker.status.connect(dialog.show_status)
         worker.progress.connect(self.progress.setValue); worker.log.connect(self.append_log)
         worker.partial.connect(dialog.show_progress); worker.v0_done.connect(dialog.add_result)
+        worker.record.connect(dialog.scan_record)
         worker.done.connect(dialog.scan_done); worker.stopped.connect(dialog.scan_stopped)
         worker.error.connect(dialog.scan_failed); worker.error.connect(self.failed)
         for signal in (worker.done, worker.error, worker.stopped): signal.connect(self.thread.quit)
@@ -3375,7 +3647,8 @@ class Window(QtWidgets.QMainWindow):
         self.result=r; self.update_mesh_result(r)
         if self.current_structure:
             try:
-                record = register_local_result(
+                # The worker registered it when it saved the project file.
+                record = r.get("result_record") or register_local_result(
                     self.current_structure, r["s"], r["mesh_path"], r)
                 if record:
                     r["result_record"] = str(record)
@@ -3488,6 +3761,8 @@ class Window(QtWidgets.QMainWindow):
         """A new intensity scale is only drawn again: no Calc."""
         self.redraw()
         if self.v0_dialog is not None:
+            box = self.v0_dialog.intensity
+            box.blockSignals(True); box.setCurrentIndex(self.intensity.currentIndex()); box.blockSignals(False)
             self.v0_dialog.redraw_current()
 
     def update_contour_lines(self, collection, segments, s, eb, data, axis):
@@ -3717,8 +3992,8 @@ DATA_FOLDER_LAYOUT = (
     (2, "structure.cif", "imported crystal structure"),
     (2, "parameter.json", "settings of this target"),
     (2, "cache/", "OpenMX runs and eigenstates (often 100s of MB)"),
-    (3, "last_pad_result.h5", "last PAD result, shown again at the next start"),
-    (2, "results/", "list of finished calculations"),
+    (2, "results/", "finished calculations, one folder each"),
+    (3, "<result>/project.h5", "PAD result, settings and V0 results, shown again"),
 )
 DATA_FOLDER_SWITCH_NOTE = (
     "Switching does not move, copy or delete any data. The previous folder "
@@ -3909,7 +4184,9 @@ class V0ScanDialog(QtWidgets.QDialog):
     now?".  The slice being calculated is shown as it fills; results already
     on screen stay instead until the new calculation has finished.  Current
     V0 then shows each V0.  The graph is drawn at exactly the size of the PAD
-    Slice panel of the main window.
+    Slice panel of the main window, with the matplotlib toolbar.  With "Save
+    image as PNG", each V0 is saved when it is finished as
+    <target>_hv=<hν>_V0=<V0>.png in the chosen folder.
     """
 
     def __init__(self, window):
@@ -3917,6 +4194,8 @@ class V0ScanDialog(QtWidgets.QDialog):
         self.window = window; self.results = {}; self.v0_values = []; self.running = False; self.geometry = None
         self.pending = None; self.keep_previous = False  # results of a running calculation
         self.shown = None  # the slice on the graph
+        self.save_folder = None  # where "Save image as PNG" writes
+        self.project = None  # project file whose V0 values and results are shown
         self.setWindowTitle("Calc with changing V0")
         self.begin = window.spin(10.0, 0.001, 1000)
         self.end = window.spin(12.0, 0.001, 1000)
@@ -3925,24 +4204,154 @@ class V0ScanDialog(QtWidgets.QDialog):
         self.calc_button.setToolTip("Calculate the PAD slice for each V0 with the other parameters of the "
                                     "main window; press again to stop")
         self.calc_button.clicked.connect(self.calc_clicked)
-        self.current = QtWidgets.QComboBox()
-        self.current.setToolTip("Calculated V0 values: choose one to show its PAD slice")
-        self.current.currentIndexChanged.connect(self.current_changed)
+        # Current V0 works like Current EB′: a number (applied with Enter),
+        # up/down buttons, arrow keys and the wheel step through the
+        # calculated V0 values, and a slider below.
+        self.result_v0s = []  # the calculated V0 values, ascending
+        self.current_input = window.spin(10.0, 0.0, 1000, cls=StepSpinBox)
+        self.current_input.setKeyboardTracking(False)
+        self.current_input.setToolTip("V0 whose PAD slice is shown: type a value and press Enter, "
+                                      "or step through the calculated V0 values")
+        self.current_input.lineEdit().returnPressed.connect(self.current_entered)
+        self.current_input.stepped.connect(self.current_entered)
+        self.current_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.current_slider.setToolTip("Calculated V0 values")
+        self.current_slider.valueChanged.connect(self.current_changed)
+        # The same Intensity display as the main window (either one sets both).
+        self.intensity = QtWidgets.QComboBox()
+        for label, gamma in INTENSITY_SCALES: self.intensity.addItem(label, gamma)
+        self.intensity.setCurrentIndex(window.intensity.currentIndex())
+        self.intensity.setToolTip(window.intensity.toolTip())
+        self.intensity.currentIndexChanged.connect(window.intensity.setCurrentIndex)
         self.status = QtWidgets.QLabel(); self.status.setWordWrap(True)
+        self.save_check = QtWidgets.QCheckBox("Save image as PNG")
+        self.save_check.setToolTip("Save the graph of each V0 as a PNG file when its calculation has finished: "
+                                   "<target>_hv=<hν>_V0=<V0>.png in a folder chosen when this is ticked")
+        self.save_check.toggled.connect(self.save_toggled)
+        self.save_label = QtWidgets.QLabel(); self.save_label.setWordWrap(True)
+        self.save_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.figure = Figure(); self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
         form = QtWidgets.QFormLayout()
         form.addRow("V0 Begin (eV)", self.begin)
         form.addRow("V0 End (eV)", self.end)
         form.addRow("V0 Step (eV)", self.step)
         form.addRow(self.calc_button)
-        form.addRow("Current V0 (eV)", self.current)
+        form.addRow("Intensity display", self.intensity)
+        form.addRow("Current V0 (eV)", self.current_input)
+        form.addRow(self.current_slider)
+        form.addRow(self.save_check)
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addLayout(form); layout.addWidget(self.status)
+        layout.addLayout(form); layout.addWidget(self.save_label); layout.addWidget(self.status)
+        layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
         # The dialog follows the canvas, which has the size of the main panel.
         layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetFixedSize)
         self.set_running(False)
+        self.update_save_label()
         self.draw(None)
+
+    def save_toggled(self, checked):
+        """Ticked: choose the folder for the PNG files (cancel unticks it)."""
+        if checked:
+            start = self.save_folder or str(self.window.current_structure or STRUCTURES)
+            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the PNG images", start)
+            if not folder:
+                self.save_check.blockSignals(True); self.save_check.setChecked(False)
+                self.save_check.blockSignals(False)
+            else:
+                self.save_folder = folder
+        self.update_save_label()
+
+    def update_save_label(self):
+        saving = self.save_check.isChecked() and self.save_folder
+        self.save_label.setVisible(bool(saving))
+        if saving:
+            self.save_label.setText(f"PNG folder: {self.save_folder}")
+            self.save_label.setToolTip(self.save_folder)
+
+    def png_path(self, view):
+        """<calculation target>_hv=<hν>_V0=<V0>.png in the chosen folder."""
+        target = view.get('structure_name') or (self.window.current_structure.name
+                                                if self.window.current_structure else "result")
+        return Path(self.save_folder) / f"{target}_hv={view['s']['hv']:g}_V0={view['v0']:g}.png"
+
+    def save_png(self, view):
+        """Save the graph of one finished V0 (as shown in the dialog)."""
+        if not (self.save_check.isChecked() and self.save_folder):
+            return None
+        path = self.png_path(view)
+        try:
+            figure = Figure(); FigureCanvasAgg(figure)
+            self.render(figure, view, self.geometry or self.window.slice_panel_geometry())
+            figure.savefig(path, dpi=self.window.canvas.figure.dpi)
+        except (OSError, ValueError) as exc:
+            self.window.append_log(f"[V0 scan] Could not save {path}: {exc}")
+            self.save_label.setText(f"PNG folder: {self.save_folder}\n⚠ Could not save {path.name}: {exc}")
+            return None
+        self.window.append_log(f"[V0 scan] Saved {path}")
+        self.save_label.setText(f"PNG folder: {self.save_folder}\nSaved: {path.name}")
+        return path
+
+    def parameters(self):
+        """The dialog values stored in the project file."""
+        return {"begin": self.begin.value(), "end": self.end.value(), "step": self.step.value(),
+                "save_png": self.save_check.isChecked(), "png_folder": self.save_folder or ""}
+
+    def follow_project(self, path, project=None):
+        """Show the V0 values and results stored in a project file (the
+        calculation result chosen in the main window); nothing while running."""
+        path = Path(path) if path else None
+        if self.running or (path == self.project and project is None):
+            return
+        if self.project is not None and path != self.project:
+            self.save_project_state()  # the one being left
+        self.project = path
+        scan = project.get("v0scan") if project is not None else None
+        if project is None and path is not None and path.is_file():
+            try:
+                scan = read_project(path, pad=False)["v0scan"]
+            except ValueError as exc:
+                self.window.append_log(f"[V0 scan] {exc}")
+        parameters = (scan or {}).get("parameters") or {}
+        for key, box in (("begin", self.begin), ("end", self.end), ("step", self.step)):
+            if isinstance(parameters.get(key), (int, float)):
+                box.setValue(parameters[key])
+        folder = parameters.get("png_folder")
+        if isinstance(folder, str) and folder:
+            self.save_folder = folder
+        self.save_check.blockSignals(True)
+        self.save_check.setChecked(bool(parameters.get("save_png")) and bool(self.save_folder))
+        self.save_check.blockSignals(False); self.update_save_label()
+        results = (scan or {}).get("results") or {}
+        self.results = {}; self.set_choices([], 0)
+        if results:
+            self.show_results(results)
+            self.status.setText(f"{len(results)} V0 values from the project file. Choose Current V0 to show each.")
+        else:
+            self.status.setText("")
+        self.set_running(False)
+        if results:
+            self.current_changed(self.current_slider.value())
+        else:
+            self.draw(None)
+
+    def save_project_state(self):
+        """Store the dialog values and the V0 results in the project file."""
+        if self.project is None or not self.window.persist_session or self.running:
+            return
+        try:
+            update_project(self.project, v0scan={"parameters": self.parameters(), "results": self.results})
+        except (OSError, ValueError) as exc:
+            self.window.append_log(f"[V0 scan] Could not save the project file: {exc}")
+
+    def scan_record(self, record):
+        """The calculation result of the k-space HDF5 used: its project file gets the results."""
+        self.project = project_path(record)
+
+    def hideEvent(self, event):
+        self.save_project_state()
+        super().hideEvent(event)
 
     def set_running(self, running):
         self.running = running
@@ -3950,7 +4359,8 @@ class V0ScanDialog(QtWidgets.QDialog):
         for box in (self.begin, self.end, self.step):
             box.setEnabled(not running)
         # While a new calculation runs, the previous results stay browsable.
-        self.current.setEnabled(self.current.count() > 0 and (not running or self.keep_previous))
+        usable = bool(self.result_v0s) and (not running or self.keep_previous)
+        self.current_input.setEnabled(usable); self.current_slider.setEnabled(usable)
 
     def confirm_start(self, values):
         """Ask before the (long) calculation; Yes starts it."""
@@ -4004,22 +4414,45 @@ class V0ScanDialog(QtWidgets.QDialog):
 
     def add_result(self, view):
         v0 = view['v0']; self.pending[v0] = view
+        self.save_png(view)  # each V0 as soon as it is finished
         if self.keep_previous:
             return
         self.results = self.pending
-        self.current.blockSignals(True)
-        self.current.addItem(f"{v0:g}", v0); self.current.setCurrentIndex(self.current.count() - 1)
-        self.current.blockSignals(False)
+        v0s = sorted(self.results); self.set_choices(v0s, v0s.index(v0))
         self.draw(view)
 
     def show_results(self, results):
         """Replace the results in Current V0 (the last V0 is selected)."""
         self.results = dict(results)
-        self.current.blockSignals(True); self.current.clear()
-        for v0 in sorted(self.results):
-            self.current.addItem(f"{v0:g}", v0)
-        self.current.setCurrentIndex(self.current.count() - 1)
-        self.current.blockSignals(False)
+        self.set_choices(sorted(self.results), len(self.results) - 1)
+
+    def set_choices(self, v0s, index):
+        """Current V0 offers these V0 values (ascending), showing v0s[index]."""
+        self.result_v0s = list(v0s)
+        self.current_slider.blockSignals(True)
+        self.current_slider.setRange(0, max(len(v0s) - 1, 0)); self.current_slider.setValue(max(index, 0))
+        self.current_slider.blockSignals(False)
+        if v0s:
+            self.current_input.blockSignals(True)
+            self.current_input.setRange(v0s[0], v0s[-1])
+            if len(v0s) > 1:  # one up/down step is one calculated V0
+                self.current_input.setSingleStep((v0s[-1] - v0s[0]) / (len(v0s) - 1))
+            self.current_input.setValue(v0s[max(index, 0)])
+            self.current_input.blockSignals(False)
+
+    def selected_v0(self):
+        return self.result_v0s[self.current_slider.value()] if self.result_v0s else None
+
+    def current_entered(self, *args):
+        """Enter or an up/down step: show the calculated V0 nearest to the value."""
+        if not self.result_v0s:
+            return
+        self.current_input.interpretText()
+        index = int(np.argmin(np.abs(np.asarray(self.result_v0s) - self.current_input.value())))
+        if index == self.current_slider.value():
+            self.current_changed(index)  # shows the exact V0 again
+        else:
+            self.current_slider.setValue(index)
 
     def scan_done(self):
         if self.keep_previous:
@@ -4041,13 +4474,16 @@ class V0ScanDialog(QtWidgets.QDialog):
         self.keep_previous = False; self.pending = None
         self.set_running(False)
         if self.results:
-            self.current_changed(self.current.currentIndex())
+            self.current_changed(self.current_slider.value())
+        self.save_project_state()
 
     def current_changed(self, index):
-        if index < 0 or (self.running and not self.keep_previous):
+        if not self.result_v0s or index < 0 or (self.running and not self.keep_previous):
             return
+        v0 = self.result_v0s[index]
+        self.current_input.blockSignals(True); self.current_input.setValue(v0); self.current_input.blockSignals(False)
         self.geometry = self.window.slice_panel_geometry()
-        self.draw(self.results.get(self.current.itemData(index)))
+        self.draw(self.results.get(v0))
 
     def redraw_current(self):
         """Draw the shown slice again (e.g. another Intensity display)."""
@@ -4060,7 +4496,14 @@ class V0ScanDialog(QtWidgets.QDialog):
             self.geometry = self.window.slice_panel_geometry()
         g = self.geometry; width, height = g['size']
         self.canvas.setFixedSize(max(1, round(width * g['ppi'])), max(1, round(height * g['ppi'])))
-        fig = self.figure; fig.clear(); fig.set_size_inches(width, height, forward=False)
+        self.render(self.figure, view, g)
+        self.toolbar.update()  # Home goes back to this graph
+        self.canvas.draw_idle()
+
+    def render(self, fig, view, g):
+        """Draw the PAD slice of one V0 (or a hint) into fig with geometry g."""
+        width, height = g['size']
+        fig.clear(); fig.set_size_inches(width, height, forward=False)
         def rect(box):
             return (box[0] / width, box[1] / height, box[2] / width, box[3] / height)
         ax = fig.add_axes(rect(g['ax']))
@@ -4080,7 +4523,7 @@ class V0ScanDialog(QtWidgets.QDialog):
                 if other is not ax: other.set_position(rect(g['colorbar']))
             ax.set_title(f"PAD Slice {s['direction']}-EB, V0={view['v0']:g} eV"
                          + ("" if view.get('complete') else " (calculating)"))
-        self.canvas.draw_idle()
+        return ax
 
 
 class PreferencesDialog(QtWidgets.QDialog):
