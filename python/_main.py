@@ -4236,13 +4236,14 @@ class V0ScanDialog(QtWidgets.QDialog):
         form.addRow("V0 Begin (eV)", self.begin)
         form.addRow("V0 End (eV)", self.end)
         form.addRow("V0 Step (eV)", self.step)
+        form.addRow(self.save_check)  # Save image as PNG and its folder, right under V0 Step
+        form.addRow(self.save_label)
         form.addRow(self.calc_button)
         form.addRow("Intensity display", self.intensity)
         form.addRow("Current V0 (eV)", self.current_input)
         form.addRow(self.current_slider)
-        form.addRow(self.save_check)
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addLayout(form); layout.addWidget(self.save_label); layout.addWidget(self.status)
+        layout.addLayout(form); layout.addWidget(self.status)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
         # The dialog follows the canvas, which has the size of the main panel.
