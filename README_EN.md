@@ -192,6 +192,8 @@ The `OpenMX Parameters` tab edits OpenMX keywords per calculation target:
 
 Before OpenMX runs, the dialog “Calculate the eigenstates of <target> with OpenMX now?” shows the k mesh, any k points already saved by an interrupted run, and how many will be calculated. Choose `Yes` to start, or `No` to stop and, for example, change N1, N2, N3 first. OpenMX logs and progress are shown while running; use `Cancel` to stop when necessary.
 
+While a calculation runs (`Calc` and `Calc with changing V0…`), the computer is kept from sleeping: `caffeinate -i -s` on macOS, `systemd-inhibit --what=idle:sleep` on Linux, chosen automatically. It stops when the calculation finishes or is cancelled, and also ends by itself if the program ends unexpectedly. The display may still turn off. The log shows `[Keep awake]`; if neither command is available, the calculation runs without it.
+
 The `Results` tab shows `K-space HDF5`: the k-space HDF5 file used for the PAD, when it was calculated, the OpenMX and HDF5 conversion times (total and wall time), and its size. The tooltip shows the full path. The times are stored in the k-space HDF5 file itself (attribute `CalculationTiming`), so they are also shown when the cache is reused, after a restart, and for an opened PAD result. A calculation that was interrupted and resumed adds up the time spent before the interruption. Caches made before this version have no recorded times and show only the date and size.
 
 ### 3. Set PAD conditions (`PAD` tab)

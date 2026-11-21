@@ -14,6 +14,8 @@ import math
 import os
 from pathlib import Path
 import shutil
+import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -1735,6 +1737,66 @@ def can_reuse_display(result, settings):
             == {k: v for k, v in settings.items() if k not in display_keys})
 
 
+def sleep_inhibit_command(pid=None):
+    """The command that keeps the computer awake while this program runs a
+    calculation: caffeinate on macOS, systemd-inhibit on Linux (None when
+    neither is available).  Both end by themselves when this process ends,
+    so a crash does not leave the computer kept awake."""
+    pid = str(pid or os.getpid())
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        # -i idle sleep, -s system sleep (on AC power), -w end with this process
+        return ["caffeinate", "-i", "-s", "-w", pid]
+    if sys.platform.startswith("linux") and shutil.which("systemd-inhibit") and shutil.which("tail"):
+        return ["systemd-inhibit", "--what=idle:sleep", "--who=SPADExp4D",
+                "--why=SPADExp4D calculation running", "--mode=block",
+                "tail", f"--pid={pid}", "-f", "/dev/null"]
+    return None
+
+
+class SleepInhibitor:
+    """Keeps the computer from sleeping between start() and stop()."""
+
+    def __init__(self):
+        self.process = None
+
+    @property
+    def active(self):
+        return self.process is not None and self.process.poll() is None
+
+    def start(self):
+        """Start keeping the computer awake; returns a line for the log."""
+        if self.active:
+            return None
+        command = sleep_inhibit_command()
+        if command is None:
+            return "[Keep awake] Not available here (needs caffeinate on macOS or systemd-inhibit on Linux)."
+        try:
+            # Own process group: stop() also ends the command systemd-inhibit runs.
+            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            self.process = None
+            return f"[Keep awake] Could not start {command[0]}: {exc}"
+        return f"[Keep awake] {command[0]} keeps the computer from sleeping during the calculation."
+
+    def stop(self):
+        process, self.process = self.process, None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                process.kill()
+            process.wait(timeout=3)
+
+
 class Worker(QtCore.QObject):
     done = QtCore.pyqtSignal(object); error = QtCore.pyqtSignal(str); stopped = QtCore.pyqtSignal(object)
     partial = QtCore.pyqtSignal(object); log = QtCore.pyqtSignal(str)
@@ -2095,6 +2157,7 @@ class Window(QtWidgets.QMainWindow):
         self._preferred_structure = self._session.get("structure")
         self.result = self.thread = self.worker = None; self._closing = False
         self.v0_dialog = None  # Calculation > Calc with changing V0…
+        self.keep_awake = SleepInhibitor()  # no sleep while a calculation runs
         self._loaded_project = None; self._loaded_project_saved = None  # last project file read
         self._display_job = 0; self._pending_display = None
         self._display_relay = DisplayRelay(self); self._display_relay.ready.connect(self.background_display_ready)
@@ -3525,7 +3588,7 @@ class Window(QtWidgets.QMainWindow):
         self.worker.done.connect(self.finished); self.worker.error.connect(self.failed); self.worker.stopped.connect(self.stopped)
         self.worker.done.connect(self.thread.quit); self.worker.error.connect(self.thread.quit); self.worker.stopped.connect(self.thread.quit)
         self.thread.finished.connect(self.worker.deleteLater); self.thread.finished.connect(self.cleanup)
-        self.thread.start()
+        self.thread.start(); self.start_keep_awake()
     def show_v0_scan(self):
         """Calculation > Calc with changing V0…"""
         if self.v0_dialog is None:
@@ -3580,7 +3643,7 @@ class Window(QtWidgets.QMainWindow):
         for signal in (worker.done, worker.error, worker.stopped): signal.connect(self.thread.quit)
         self.thread.finished.connect(worker.deleteLater); self.thread.finished.connect(self.cleanup)
         self.thread.finished.connect(dialog.scan_finished)
-        self.thread.start()
+        self.thread.start(); self.start_keep_awake()
         return True
 
     def slice_panel_geometry(self):
@@ -3638,7 +3701,11 @@ class Window(QtWidgets.QMainWindow):
         self.mesh_result.setToolTip(str(result.get('mesh_path', '')))
     def partial_result(self,r):
         self.result=r; self.update_mesh_result(r); self.redraw()
+    def start_keep_awake(self):
+        line = self.keep_awake.start()
+        if line: self.append_log(line)
     def cleanup(self):
+        self.keep_awake.stop()
         self.thread.deleteLater(); self.thread=self.worker=None
         self.calc.setEnabled(True); self.calc_action.setEnabled(True); self.cancel_action.setEnabled(False)
         self.set_eb_sweep_running(False)
