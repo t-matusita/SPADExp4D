@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """4-D (kx, ky, kz, E) viewer using a reusable first-BZ eigenstate database."""
 
-# SPADExp4D 1.3.0: integrated Python, C++ and per-Structure caches.
+# SPADExp4D 1.4.0: integrated Python, C++ and per-Structure caches.
 
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import argparse
 import hashlib

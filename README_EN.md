@@ -2,7 +2,7 @@
 
 English | [日本語](README_JP.md)
 
-Current version: **1.3.0**
+Current version: **1.4.0**
 
 SPADExp4D is research software for calculating and visualizing photoemission angular distributions (PADs) for angle-resolved photoemission spectroscopy (ARPES) in four-dimensional `(kx, ky, kz, E)` space using output from the first-principles code OpenMX.
 
